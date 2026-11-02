@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.lithometric.imessager</string>
+	<key>CFBundleName</key>
+	<string>iMessager</string>
+	<key>CFBundleDisplayName</key>
+	<string>iMessager</string>
+	<key>CFBundleExecutable</key>
+	<string>iMessager</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.productivity</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>iMessager sends replies for the conversations you switch on through the Messages app.</string>
+	<key>NSContactsUsageDescription</key>
+	<string>iMessager shows contact names, spots new numbers, and can save people who introduce themselves.</string>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>iMessager lets the AI see your upcoming events so it knows when you're free.</string>
+	<key>NSCalendarsUsageDescription</key>
+	<string>iMessager lets the AI see your upcoming events so it knows when you're free.</string>
+</dict>
+</plist>
