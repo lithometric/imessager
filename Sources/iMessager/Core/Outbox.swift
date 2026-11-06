@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 enum SendOrigin: Sendable {
@@ -49,11 +50,19 @@ extension AppState {
     @discardableResult
     func enqueue(_ text: String, chat: String, guid: String, handle: String?, origin: SendOrigin, attachment: URL? = nil,
                  asTextMessage: Bool = false, hold: Double? = nil, ms: Int? = nil, detail: String? = nil) -> OutgoingMessage {
-        let wait = hold ?? (origin == .you || config.holdAIReplies ? max(0, config.undoSendSeconds) : 0)
+        let base = hold ?? (origin == .you || config.holdAIReplies ? max(0, config.undoSendSeconds) : 0)
+        // You're not looking at iMessager: the AI's text waits a little, announced with an Undo button.
+        let away = origin != .you && attachment == nil && !NSApp.isActive && config.notifications.aiReplies && config.aiUndoSeconds > 0
+        let wait = away ? max(base, config.aiUndoSeconds) : base
         let item = OutgoingMessage(chat: chat, guid: guid, handle: handle, text: text, attachment: attachment, origin: origin,
                                    asTextMessage: asTextMessage, sendAt: Date().addingTimeInterval(wait), ms: ms, detail: detail)
         outbox.append(item)
         schedule(item.id, after: wait)
+        if away {
+            announced.insert(item.id)
+            Notifier.shared.postAIReply(item.id, chat: chat, title: title(for: chat), text: text,
+                                        status: "\(providerName) is replying · sends in \(Int(wait)) s", undo: true)
+        }
         return item
     }
 
@@ -71,8 +80,20 @@ extension AppState {
         guard let i = outbox.firstIndex(where: { $0.id == id }), outbox[i].phase == .queued else { return nil }
         outboxTimers.removeValue(forKey: id)?.cancel()
         let item = outbox.remove(at: i)
+        if announced.remove(id) != nil { Notifier.shared.removeAIReply(id) }
         log(.info, item.chat, "Unsent before it went out: \(item.text)")
         return item
+    }
+
+    /// Undo from an AI reply's notification: it doesn't go out, and the AI steps back from that chat like it does when
+    /// you reply yourself.
+    func undoAIReply(_ id: UUID) {
+        guard let item = undoSend(id) else {
+            Notifier.shared.post(title: "Too late to undo", subtitle: "", body: "That reply had already been sent.", chat: nil)
+            return
+        }
+        log(.info, item.chat, "You undid the AI's reply from its notification")
+        Task { await agent?.userIsReplying(item.chat) }
     }
 
     /// Try Again (or Send as Text Message) for a text that failed on its way to Messages.
@@ -124,6 +145,7 @@ extension AppState {
         let item = outbox[i]
         // Your own texts are left to look like manual replies, so the agent steps back for this chat.
         if item.origin != .you { await agent?.expectEcho(item.chat, item.text) }
+        await sender.launchMessagesIfNeeded()
         let result = Result {
             if let file = item.attachment {
                 try sender.sendFile(file, chatGUID: item.guid, handle: item.handle, asTextMessage: item.asTextMessage)
@@ -136,6 +158,7 @@ extension AppState {
         case .success:
             outbox[j].phase = .sent
             if item.origin != .you {
+                rememberAIText(item.text, in: item.chat)
                 config.stats.aiReplies += item.origin == .ai ? 1 : 0
                 config.stats.greetings += item.origin == .greeter ? 1 : 0
                 if let ms = item.ms {
@@ -145,9 +168,13 @@ extension AppState {
             }
             log(item.origin == .greeter ? .greeted : .sent, item.chat, item.text, ms: item.ms,
                 detail: [item.asTextMessage ? "Text message" : nil, item.detail].compactMap { $0 }.joined(separator: " · ").nilIfEmpty)
-            if item.origin == .ai, config.notifications.aiReplies {
-                Notifier.shared.post(title: title(for: item.chat), subtitle: "AI replied for you", body: item.text, chat: item.chat)
-            } else if item.origin == .greeter, config.notifications.greetings {
+            // Only while you're away from iMessager: in front of it, you just saw it happen.
+            if announced.remove(id) != nil {
+                Notifier.shared.postAIReply(id, chat: item.chat, title: title(for: item.chat), text: item.text,
+                                            status: item.origin == .greeter ? "New contact greeted" : "\(providerName) replied for you", undo: false)
+            } else if !NSApp.isActive, item.origin == .ai, config.notifications.aiReplies {
+                Notifier.shared.post(title: title(for: item.chat), subtitle: "\(providerName) replied for you", body: item.text, chat: item.chat)
+            } else if !NSApp.isActive, item.origin == .greeter, config.notifications.greetings {
                 Notifier.shared.post(title: title(for: item.chat), subtitle: "New contact greeted", body: item.text, chat: item.chat)
             }
             // The chat.db copy replaces this one in the transcript within a second or two.
@@ -156,6 +183,7 @@ extension AppState {
                 outbox.removeAll { $0.id == id && $0.phase == .sent }
             }
         case .failure(let error):
+            if announced.remove(id) != nil { Notifier.shared.removeAIReply(id) }
             outbox[j].phase = .failed(error.localizedDescription)
             log(.error, item.chat, "Couldn't send “\(item.attachment?.lastPathComponent ?? String(item.text.prefix(80)))”: \(error.localizedDescription)")
             if config.notifications.failures {
@@ -163,6 +191,25 @@ extension AppState {
                                      body: item.attachment?.lastPathComponent ?? item.text, chat: item.chat, outboxID: id, failed: true)
             }
         }
+    }
+}
+
+extension AppState {
+    /// Notes that the AI wrote this text, so it isn't mistaken for how you talk.
+    func rememberAIText(_ text: String, in chat: String) {
+        guard !text.isEmpty else { return }
+        var list = config.aiWritten[chat] ?? []
+        list.append(Self.fingerprint(text))
+        if list.count > 40 { list.removeFirst(list.count - 40) }
+        config.aiWritten[chat] = list
+    }
+
+    /// A short stable id for a text, ignoring case, spacing and punctuation.
+    nonisolated static func fingerprint(_ text: String) -> String {
+        let core = text.lowercased().unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) }
+        let hash = String(String.UnicodeScalarView(core)).utf8
+            .reduce(UInt64(14_695_981_039_346_656_037)) { ($0 ^ UInt64($1)) &* 1_099_511_628_211 }
+        return String(hash, radix: 36)
     }
 }
 

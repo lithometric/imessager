@@ -96,6 +96,11 @@ actor MCPIntegration: Integration {
     func call(_ tool: String, _ args: JSON) async throws -> String {
         let arguments: JSON = args.object != nil ? args : .object([:])
         let result = try await request("tools/call", ["name": .string(originals[tool] ?? tool), "arguments": arguments], timeout: 60)
+        return try Self.text(from: result)
+    }
+
+    /// A tools/call result as plain text for the model (shared with the remote client).
+    static func text(from result: JSON) throws -> String {
         let parts = (result["content"]?.array ?? []).compactMap { item -> String? in
             switch item["type"]?.string {
             case "text": item["text"]?.string
@@ -190,7 +195,7 @@ actor MCPIntegration: Integration {
         pending.values.forEach { $0.resume(throwing: error) }
     }
 
-    private static func cleanSchema(_ schema: JSON?) -> JSON {
+    static func cleanSchema(_ schema: JSON?) -> JSON {
         guard var o = schema?.object else { return ["type": "object", "properties": .object([:])] }
         o["$schema"] = nil
         if o["type"] == nil { o["type"] = "object" }

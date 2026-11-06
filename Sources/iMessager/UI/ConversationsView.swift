@@ -60,8 +60,14 @@ struct ConversationList: View {
     @State private var query = ""
     @State private var filter: ChatFilter = .messages
 
+    /// The search text, unless it's a question or request the AI is handling (then the list stays as it was).
+    private var searching: String {
+        state.command?.request == query ? "" : query
+    }
+
     private var filtered: [ChatSummary] {
-        state.chats.filter { chat in
+        let query = searching
+        return state.chats.filter { chat in
             guard filter.matches(chat, state) else { return false }
             guard !query.isEmpty else { return true }
             return chat.title.localizedCaseInsensitiveContains(query) || chat.id.localizedCaseInsensitiveContains(query)
@@ -71,7 +77,7 @@ struct ConversationList: View {
 
     /// Pins sit on top of the main list, like Messages.
     private var pinned: [ChatSummary] {
-        guard filter == .messages, query.isEmpty else { return [] }
+        guard filter == .messages, searching.isEmpty else { return [] }
         return state.chats.filter(\.isPinned).sorted { $0.pin! < $1.pin! }
     }
 
@@ -79,10 +85,29 @@ struct ConversationList: View {
         let pins = pinned
         let rows = filtered.filter { pins.isEmpty || !$0.isPinned }
         VStack(spacing: 0) {
-            SearchField(text: $query, prompt: "Search")
-                .padding(.horizontal, 12)
-                .padding(.top, 4)
-                .padding(.bottom, 8)
+            // Doubles as a command bar: a question or a request ("text everyone at a YC company…") goes to the AI.
+            SearchField(text: $query, prompt: "Search or ask",
+                        working: state.command?.running == true ? Brand.providerColor(state.config.provider) : nil) {
+                if Commander.looksLikeCommand(query) || (filtered.isEmpty && query.split(separator: " ").count >= 2) {
+                    ask()
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.top, 4)
+            .padding(.bottom, 8)
+            VStack(spacing: 8) {
+                if let run = state.command, run.running, run.drafts.isEmpty, run.answer.isEmpty {
+                    CommandStep(step: run.step).padding(.horizontal, 10)
+                } else if let run = state.command {
+                    CommandPanel(run: run)
+                }
+                if Commander.looksLikeCommand(query), state.command?.request != query {
+                    CommandHint(query: query, run: ask)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.bottom, state.command != nil || Commander.looksLikeCommand(query) ? 8 : 0)
+            .animation(.easeOut(duration: 0.2), value: state.command)
             if state.dbAccess == .checking || (state.hasDiskAccess && !state.chatsLoaded) {
                 ListSkeleton()
             } else {
@@ -92,15 +117,39 @@ struct ConversationList: View {
                         .listRowSeparator(.hidden)
                         .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 6, trailing: 4))
                         .selectionDisabled()
+                } else if filter == .messages, searching.isEmpty {
+                    PinDropZone()
+                        .listRowSeparator(.hidden)
+                        .selectionDisabled()
                 }
                 Section {
                     ForEach(Array(rows.enumerated()), id: \.element.id) { i, chat in
-                        ChatRow(chat: chat, separator: i > 0)
+                        // Like Messages, the lines touching the selected conversation disappear.
+                        ChatRow(chat: chat, separator: i > 0 && chat.id != selection && rows[i - 1].id != selection)
                             .tag(chat.id)
+                            // Drag a conversation up into the pins to pin it.
+                            .draggable(ChatDrag.payload(chat.id)) {
+                                Avatar(title: chat.title, isGroup: chat.isGroup, size: 44, handle: chat.photoHandle,
+                                       photoPath: chat.photoPath, members: chat.participants)
+                            }
+                            // Drop a pin back into the list to unpin it.
+                            .dropDestination(for: String.self) { items, _ in
+                                guard let id = items.compactMap(ChatDrag.id).first, state.pinnedIDs.contains(id) else { return false }
+                                withAnimation(.snappy) { state.unpin(id) }
+                                return true
+                            }
                     }
                 } header: {
                     if filter != .messages {
-                        Label(filter.title, systemImage: filter.icon)
+                        HStack {
+                            Label(filter.title, systemImage: filter.icon)
+                            Spacer()
+                            if filter == .promotions, !state.unsubscribeCandidates.isEmpty {
+                                Button("Unsubscribe…") { state.modal = .unsubscribe }
+                                    .buttonStyle(.plain)
+                                    .foregroundStyle(Color.accentColor)
+                            }
+                        }
                     }
                 }
             }
@@ -119,16 +168,31 @@ struct ConversationList: View {
                     selection = nil
                     state.composing = false
                 }
+                .hiddenUnderModal()
             }
+            .glassBackdropHidden(state.modal != nil)
             ToolbarItem {
-                FilterMenu(filter: $filter)
+                Button { state.modal = .settings } label: { Label("Settings", systemImage: "gearshape") }
+                    .labelStyle(.iconOnly)
+                    .hiddenUnderModal()
             }
+            .glassBackdropHidden(state.modal != nil)
+            ToolbarItem {
+                FilterMenu(filter: $filter).hiddenUnderModal()
+            }
+            .glassBackdropHidden(state.modal != nil)
         }
+    }
+
+    private func ask() {
+        let request = query.trimmed
+        guard state.aiReady, !request.isEmpty, state.command?.request != request || state.command?.running == false else { return }
+        state.runCommand(request)
     }
 
     @ViewBuilder private var emptyState: some View {
         if state.hasDiskAccess {
-            ContentUnavailableView(query.isEmpty ? "Nothing here" : "No matches", systemImage: "magnifyingglass",
+            ContentUnavailableView(searching.isEmpty ? "Nothing here" : "No matches", systemImage: "magnifyingglass",
                                    description: Text(filter == .messages ? "Try a different search." : "Try another filter."))
         } else {
             ContentUnavailableView {
@@ -159,7 +223,6 @@ private struct HomeButton: View {
             }
         }
         .labelStyle(.iconOnly)
-        .help(active ? "Home" : "Home: your overview")
         .accessibilityAddTraits(active ? .isSelected : [])
     }
 }
@@ -183,7 +246,6 @@ private struct FilterMenu: View {
             Label("Filter", systemImage: filter == .messages ? "line.3.horizontal.decrease" : "line.3.horizontal.decrease.circle.fill")
         }
         .menuIndicator(.hidden)
-        .help("Filter: \(filter.title)")
     }
 
     private var summary: String {
@@ -197,18 +259,76 @@ private struct FilterMenu: View {
     }
 }
 
-/// Pinned conversations as large avatars, three across, like Messages.
-private struct PinnedGrid: View {
-    let chats: [ChatSummary]
-    @Binding var selection: String?
+/// With nothing pinned yet: a quiet target to drag a conversation onto.
+private struct PinDropZone: View {
+    @Environment(AppState.self) private var state
+    @State private var targeted = false
 
     var body: some View {
+        Label("Drag a conversation here to pin it", systemImage: "pin")
+            .font(.caption)
+            .foregroundStyle(targeted ? Color.accentColor : Color.secondary)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 10)
+            .background(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(targeted ? Color.accentColor : Color.primary.opacity(0.12), style: StrokeStyle(lineWidth: 1.2, dash: [5, 4])))
+            .dropDestination(for: String.self) { items, _ in
+                guard let id = items.compactMap(ChatDrag.id).first else { return false }
+                withAnimation(.snappy) { state.pin(id) }
+                return true
+            } isTargeted: { targeted = $0 }
+    }
+}
+
+/// Pinned conversations as large avatars, three across, like Messages.
+private struct PinnedGrid: View {
+    @Environment(AppState.self) private var state
+    let chats: [ChatSummary]
+    @Binding var selection: String?
+    @State private var targeted: String?
+    @State private var gridTargeted = false
+
+    var body: some View {
+        // Room above the first row for the preview bubbles that pop up over its pins.
+        let lifted = chats.prefix(3).contains { $0.unread > 0 && !$0.lastFromMe }
         LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 3), spacing: 6) {
             ForEach(chats) { chat in
                 PinnedItem(chat: chat, selected: selection == chat.id) { selection = chat.id }
+                    .draggable(ChatDrag.payload(chat.id)) {
+                        Avatar(title: chat.title, isGroup: chat.isGroup, size: 56, handle: chat.photoHandle,
+                               photoPath: chat.photoPath, members: chat.participants)
+                    }
+                    // Drop on a pin to put the dragged conversation in its place.
+                    .dropDestination(for: String.self) { items, _ in
+                        guard let id = items.compactMap(ChatDrag.id).first else { return false }
+                        withAnimation(.snappy) { state.movePin(id, before: chat.id) }
+                        return true
+                    } isTargeted: { over in targeted = over ? chat.id : (targeted == chat.id ? nil : targeted) }
+                    .overlay(alignment: .leading) {
+                        if targeted == chat.id {
+                            Capsule().fill(Color.accentColor).frame(width: 3).padding(.vertical, 14).offset(x: -4)
+                        }
+                    }
             }
         }
+        // Drop anywhere else in the pinned area to pin it at the end.
+        .dropDestination(for: String.self) { items, _ in
+            guard let id = items.compactMap(ChatDrag.id).first else { return false }
+            withAnimation(.snappy) { state.pin(id) }
+            return true
+        } isTargeted: { gridTargeted = $0 }
+        .background(gridTargeted && targeted == nil ? Color.accentColor.opacity(0.08) : .clear,
+                    in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .padding(.top, lifted ? 14 : 0)
+        .animation(.easeOut(duration: 0.2), value: lifted)
     }
+}
+
+/// Conversations dragged around the sidebar travel as a tagged string, so stray text drops are ignored.
+enum ChatDrag {
+    private static let prefix = "imessager-chat:"
+    static func payload(_ id: String) -> String { prefix + id }
+    static func id(_ payload: String) -> String? { payload.hasPrefix(prefix) ? String(payload.dropFirst(prefix.count)) : nil }
 }
 
 private struct PinnedItem: View {
@@ -222,18 +342,19 @@ private struct PinnedItem: View {
             VStack(spacing: 6) {
                 Avatar(title: chat.title, isGroup: chat.isGroup, active: false, size: 62, handle: chat.photoHandle,
                        photoPath: chat.photoPath, members: chat.participants)
-                    .overlay(alignment: .topLeading) {
-                        // New messages: a blue dot on the photo.
-                        if chat.unread > 0 {
-                            Circle()
-                                .fill(Color.accentColor)
-                                .frame(width: 14, height: 14)
-                                .overlay(Circle().strokeBorder(Color(nsColor: .windowBackgroundColor), lineWidth: 2.5))
-                                .offset(x: 1, y: 1)
-                                .help("\(chat.unread) new")
+                    .overlay(alignment: .top) {
+                        // Like Messages: their latest unread text pops up over the pin in a little thought bubble.
+                        if let preview {
+                            PinPreview(text: preview)
+                                .alignmentGuide(.top) { $0[.bottom] - 14 }
+                                .transition(.scale(scale: 0.5, anchor: .bottomLeading).combined(with: .opacity))
                         }
                     }
+                    .animation(.spring(response: 0.38, dampingFraction: 0.7), value: preview)
                 HStack(spacing: 4) {
+                    if chat.unread > 0 {
+                        Circle().fill(Color.accentColor).frame(width: 7, height: 7)
+                    }
                     Text(chat.title)
                         .font(.system(size: 11, weight: chat.unread > 0 ? .semibold : .regular))
                         .lineLimit(1)
@@ -248,9 +369,12 @@ private struct PinnedItem: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .onHover { hovering = $0 }
-        .help(chat.title)
+        .onHover {
+            hovering = $0
+            if $0 { AppState.shared.warmThread(chat.id) }
+        }
         .contextMenu {
+            Button("Unpin") { withAnimation(.snappy) { AppState.shared.unpin(chat.id) } }
             if chat.unread > 0 {
                 Button("Mark as Read") { AppState.shared.markRead(chat.id) }
             } else {
@@ -262,6 +386,42 @@ private struct PinnedItem: View {
     private var background: Color {
         if selected { return .accentColor }
         return hovering ? Color.primary.opacity(0.06) : .clear
+    }
+
+    /// Their latest text while it's unread (your own last text, or a read chat, shows nothing).
+    private var preview: String? {
+        guard chat.unread > 0, !chat.lastFromMe else { return nil }
+        let text = chat.preview.trimmed
+        return text.isEmpty ? nil : text
+    }
+}
+
+/// A pinned conversation's newest unread text in a small gray bubble with a thought-bubble tail, as Messages does.
+private struct PinPreview: View {
+    let text: String
+    @Environment(\.colorScheme) private var scheme
+
+    var body: some View {
+        let fill = scheme == .dark ? Color(white: 0.24) : Color(white: 0.92)
+        Text(text)
+            .font(.system(size: 10.5))
+            .foregroundStyle(.primary)
+            .multilineTextAlignment(.center)
+            .lineLimit(2)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(fill, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+            .overlay(alignment: .bottomLeading) {
+                ZStack(alignment: .topLeading) {
+                    Circle().fill(fill).frame(width: 7, height: 7).offset(x: 14, y: 4)
+                    Circle().fill(fill).frame(width: 3.5, height: 3.5).offset(x: 11, y: 11)
+                }
+                .frame(width: 7, height: 7, alignment: .topLeading)
+            }
+            .shadow(color: .black.opacity(0.22), radius: 3, y: 1)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(width: 104)
+            .allowsHitTesting(false)
     }
 }
 
@@ -302,7 +462,6 @@ struct ChatRow: View {
                         Image(systemName: "exclamationmark.circle.fill")
                             .font(.system(size: 11))
                             .foregroundStyle(.red)
-                            .help("Not Delivered")
                     }
                     Text(Fmt.short(chat.lastDate))
                         .font(.system(size: 11))
@@ -314,7 +473,6 @@ struct ChatRow: View {
                         .font(.system(size: 12))
                         .foregroundStyle(.secondary)
                         .lineLimit(2, reservesSpace: true)
-                        .help("Summary of \(chat.unread) unread messages")
                 } else {
                     Text(previewText)
                         .font(.system(size: 12))
@@ -323,15 +481,21 @@ struct ChatRow: View {
                 }
             }
         }
-        .padding(.vertical, 7)
+        .padding(.vertical, 11)
         .overlay(alignment: .top) {
             if separator {
                 Divider().padding(.leading, 64).offset(y: -1)
             }
         }
         .contentShape(Rectangle())
-        .help(chat.isGroup ? "\(chat.title) · group of \(chat.participants.count + 1)" : chat.title)
+        .onHover { if $0 { state.warmThread(chat.id) } }
         .contextMenu {
+            if chat.isPinned {
+                Button("Unpin") { withAnimation(.snappy) { state.unpin(chat.id) } }
+            } else {
+                Button("Pin") { withAnimation(.snappy) { state.pin(chat.id) } }
+                    .disabled(!state.canPinMore)
+            }
             if chat.unread > 0 {
                 Button("Mark as Read") { state.markRead(chat.id) }
             } else {
@@ -358,6 +522,24 @@ struct ChatRow: View {
 struct ChatDetailView: View {
     @Environment(AppState.self) private var state
     let chat: ChatSummary
+
+    init(chat: ChatSummary) {
+        self.chat = chat
+        // Opened before (or preloaded): show it right away, already settled, and refresh quietly behind it.
+        let cached = AppState.shared.cachedThread(chat.id)
+        _messages = State(initialValue: cached ?? [])
+        _loaded = State(initialValue: cached != nil)
+        _revealed = State(initialValue: cached != nil)   // no fade for a cached thread; it still settles on the newest message first
+        _limit = State(initialValue: max(Self.page, cached?.count ?? 0))
+        _rendered = State(initialValue: Self.firstDraw)
+    }
+
+    /// How many messages a thread loads, and how many more scrolling to the top fetches.
+    private static let page = 80
+    /// How many of the newest it draws on open (enough to fill the window). Laying out every bubble at once is
+    /// what made opening a conversation slow; the rest appear as you scroll up.
+    private static let firstDraw = 30
+
     @State private var messages: [ChatMessage] = []
     @State private var draft = ""
     @State private var info = ""
@@ -379,6 +561,14 @@ struct ChatDetailView: View {
     @State private var viewingMedia: URL?
     @State private var highlighted: String?
     @State private var revealed = false
+    @State private var showSkeleton = false
+    @State private var spring = ScrollSpring()
+    /// When the conversation opened: only bubbles that arrive after this animate in.
+    @State private var openedAt = Date()
+    @State private var limit = 80
+    @State private var rendered = 30
+    @State private var loadingOlder = false
+    @State private var reachedStart = false
     @FocusState private var composerFocused: Bool
 
     private var handle: String? { chat.isGroup ? nil : chat.id }
@@ -387,8 +577,12 @@ struct ChatDetailView: View {
     var body: some View {
         transcript
             .toolbar {
-                ToolbarItem(placement: .principal) { titlePill }
-                ToolbarItem(placement: .primaryAction) { autoReplyButton }
+                ToolbarItem(placement: .principal) { titlePill.hiddenUnderModal() }
+                    .glassBackdropHidden(state.modal != nil)
+                ToolbarItem(placement: .primaryAction) { autoReplyButton.hiddenUnderModal() }
+                    .glassBackdropHidden(state.modal != nil)
+                ToolbarItem(placement: .primaryAction) { callMenu.hiddenUnderModal() }
+                    .glassBackdropHidden(state.modal != nil)
             }
             .overlay {
                 if let url = viewingMedia {
@@ -437,9 +631,14 @@ struct ChatDetailView: View {
                 if let pasteMonitor { NSEvent.removeMonitor(pasteMonitor) }
                 if state.viewingChat == chat.id { state.viewingChat = nil }
             }
-            .task(id: state.revision) {
+            .task(id: [state.revision, limit]) {
             // Re-read on every chat.db change (receipts included), but only re-render when something actually changed.
-            let fresh = await state.history(chat.id, limit: 80)
+            let fresh = await state.history(chat.id, limit: limit)
+            if loadingOlder {
+                // Asking for more and getting nothing new means this is the start of the conversation.
+                reachedStart = fresh.count <= messages.count
+                loadingOlder = false
+            }
             if fresh != messages { messages = fresh }
             let loadedGuids = Set(fresh.map(\.guid))
             let missing = Set(fresh.compactMap(\.threadOriginator)).subtracting(loadedGuids).subtracting(originals.keys)
@@ -449,6 +648,12 @@ struct ChatDetailView: View {
             loaded = true
             // Looking at it counts as reading it, as in Messages (only while iMessager is the app in front).
             if NSApp.isActive { state.markRead(chat.id, through: fresh.last?.date) }
+        }
+        // A to-do checked off on Home: its follow-up gets written into the composer, ready to send.
+        .task(id: state.todoDrafts[chat.id]) {
+            guard let todo = state.todoDrafts[chat.id] else { return }
+            state.todoDrafts[chat.id] = nil
+            await generate(todo: todo)
         }
         .task(id: lastDeleted?.id) {
             try? await Task.sleep(for: .seconds(8))
@@ -493,7 +698,6 @@ struct ChatDetailView: View {
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)
-        .help("\(chat.title) · \(subtitle) · \(chat.service)")
         .popover(isPresented: $showDetails, arrowEdge: .bottom) {
             ChatDetails(chat: chat)
         }
@@ -518,9 +722,36 @@ struct ChatDetailView: View {
             }
             .foregroundStyle(on ? Brand.providerColor(provider) : Color.secondary.opacity(0.6))
         }
-        .help(on ? "Auto-reply is on: \(name) answers this conversation for you. Click to turn it off."
-              : "Auto-reply is off. Click to let \(name) answer this conversation.")
         .accessibilityLabel(on ? "Auto-reply On" : "Auto-reply Off")
+    }
+
+    /// Messages' video button: FaceTime audio or video, or a phone call through your iPhone, in the FaceTime app.
+    private var callMenu: some View {
+        Menu {
+            if chat.isGroup {
+                Button { open("facetime://") } label: { Label("Open FaceTime", systemImage: "video") }
+            } else {
+                Button { call("facetime-audio") } label: { Label("FaceTime Audio", systemImage: "phone") }
+                Button { call("facetime") } label: { Label("FaceTime Video", systemImage: "video") }
+                if canText {
+                    Divider()
+                    Button { call("tel") } label: { Label("Phone Call", systemImage: "iphone") }
+                }
+            }
+        } label: {
+            Label("Call", systemImage: "video")
+        }
+        .menuIndicator(.hidden)
+        .accessibilityLabel("Call")
+    }
+
+    private func call(_ scheme: String) {
+        let handle = chat.id.contains("@") ? chat.id : ContactsIndex.normalized(chat.id)
+        open("\(scheme)://\(handle)")
+    }
+
+    private func open(_ address: String) {
+        if let url = URL(string: address) { NSWorkspace.shared.open(url) }
     }
 
     // MARK: Transcript
@@ -535,12 +766,22 @@ struct ChatDetailView: View {
     }
 
     private var transcript: some View {
-        let shown = messages.filter { !state.isHidden($0) }
+        let shown = Array(messages.filter { !state.isHidden($0) }.suffix(rendered))
         let queue = pending(after: shown)
         let lastMine = shown.last(where: { $0.isFromMe && !$0.isRetracted })?.id
         return ScrollViewReader { proxy in
             // Built only once the messages are in, so it opens at the newest message rather than mid-thread.
-            if loaded { scroll(shown, queue, lastMine, proxy) } else { TranscriptSkeleton() }
+            if loaded {
+                scroll(shown, queue, lastMine, proxy)
+            } else {
+                // Only if loading is actually slow: a placeholder that flashes for a few ms reads as jank.
+                Color.clear
+                    .overlay { if showSkeleton { TranscriptSkeleton().transition(.opacity) } }
+                    .task {
+                        try? await Task.sleep(for: .milliseconds(150))
+                        if !loaded { withAnimation(.easeOut(duration: 0.15)) { showSkeleton = true } }
+                    }
+            }
         }
         .floatingBar(.bottom) { composer }
     }
@@ -556,43 +797,54 @@ struct ChatDetailView: View {
                                 .foregroundStyle(.secondary)
                                 .padding(.top, i == 0 ? 0 : 14)
                                 .padding(.bottom, 4)
+                                .springy(spring)
                         }
                         row(m, previous: i > 0 ? shown[i - 1] : nil, next: i + 1 < shown.count ? shown[i + 1] : nil,
                             showStatus: m.id == lastMine && queue.isEmpty)
                             .background(highlighted == m.guid ? Color.accentColor.opacity(0.14) : .clear,
                                         in: RoundedRectangle(cornerRadius: 16, style: .continuous))
                             .animation(.easeOut(duration: 0.25), value: highlighted)
-                            .modifier(Reveal(order: shown.count - 1 - i, on: revealed))
+                            .arrives(!m.isFromMe && m.date > openedAt ? .received : nil)
+                            .springy(spring)
                             .id(m.guid)
                     }
-                    ForEach(queue) { pendingRow($0) }
+                    ForEach(queue) { item in
+                        pendingRow(item)
+                            .arrives(item.created > openedAt ? .sent : nil)
+                            .springy(spring)
+                    }
                     if state.replying[chat.id] != nil {
                         HStack {
                             Spacer()
                             TypingBubble()
                         }
+                        .springy(spring)
                         .transition(.opacity.combined(with: .scale(scale: 0.8, anchor: .bottomTrailing)))
                     }
-                    Color.clear.frame(height: 1).id("bottom")
+                    // The bottom margin itself, so going "to the bottom" lands exactly where the thread opens.
+                    Color.clear.frame(height: 8).id("bottom")
                 }
                 .padding(.horizontal, 20)
                 .padding(.top, 16)
-                .padding(.bottom, 8)
             }
             .defaultScrollAnchor(.bottom)
             .staysAtBottom()
+            .followsTranscript(proxy, ready: positioned) { loadOlder() }
+            .tracksSpeed(spring)
+            // Bubbles near the pointer move with it; farther ones trail behind.
+            .onContinuousHover { phase in
+                if case .active(let point) = phase { spring.anchor = point.y } else { spring.anchor = nil }
+            }
             .softScrollEdge(.bottom)
-            // Hidden for a beat until it's sitting on the newest message, so opening a thread never shows a jump.
-            .opacity(positioned ? 1 : 0)
+            // The anchor puts the first frame on the newest message, so it shows at once with no settling step.
+            // A cached thread just appears; one that had to be loaded fades in.
+            .opacity(revealed ? 1 : 0)
+            .animation(.easeOut(duration: 0.12), value: revealed)
             .onAppear {
+                revealed = true
                 DispatchQueue.main.async {
-                    proxy.scrollTo("bottom", anchor: .bottom)
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
-                        proxy.scrollTo("bottom", anchor: .bottom)
-                        positioned = true
-                        revealed = true
-                    }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { proxy.scrollTo("bottom", anchor: .bottom) }
+                    proxy.scrollTo("bottom", anchor: .bottom)   // in case the anchor didn't take
+                    positioned = true
                 }
             }
             .onChange(of: shown.last?.id) { proxy.scrollTo("bottom", anchor: .bottom) }
@@ -608,6 +860,19 @@ struct ChatDetailView: View {
             .animation(.spring(duration: 0.3, bounce: 0.15), value: openThread)
     }
 
+    /// Scrolled up to the top: read further back, first from what's already loaded, then from chat.db.
+    /// Older messages go in above without moving what you're looking at.
+    private func loadOlder() {
+        guard loaded else { return }
+        if rendered < messages.count {
+            rendered = min(messages.count, rendered + 40)
+        } else if !loadingOlder, !reachedStart {
+            loadingOlder = true
+            rendered += 40
+            limit = messages.count + Self.page
+        }
+    }
+
     @ViewBuilder
     private func row(_ m: ChatMessage, previous: ChatMessage?, next: ChatMessage?, showStatus: Bool) -> some View {
         if chat.isGroup && !m.isFromMe && !m.isRetracted {
@@ -616,7 +881,6 @@ struct ChatDetailView: View {
             HStack(alignment: .bottom, spacing: 6) {
                 if endOfRun {
                     Avatar(title: name(of: m), size: 26, handle: m.sender)
-                        .help(name(of: m))
                 } else {
                     Color.clear.frame(width: 26, height: 1)
                 }
@@ -659,9 +923,53 @@ struct ChatDetailView: View {
                         .padding(.horizontal, 6)
                 }
             }
+        } else if let link = linkOnly(m) {
+            // Just a link: a rich card in its place, like Messages (the URL itself isn't shown).
+            VStack(alignment: m.isFromMe ? .trailing : .leading, spacing: 3) {
+                if let sender = senderName(m, previous: previous) {
+                    Text(sender).font(.caption2).foregroundStyle(.secondary).padding(.horizontal, 12)
+                }
+                HStack(spacing: 0) {
+                    if m.isFromMe { Spacer(minLength: 90) }
+                    RichLinkBubble(url: link, fromMe: m.isFromMe)
+                        .overlay(alignment: m.isFromMe ? .topLeading : .topTrailing) {
+                            if !m.reactions.isEmpty {
+                                HStack(spacing: -7) {
+                                    ForEach(Array(m.reactions.enumerated()), id: \.offset) { _, r in ReactionBadge(reaction: r) }
+                                }
+                                .offset(x: m.isFromMe ? -12 : 12, y: -14)
+                            }
+                        }
+                        .padding(.top, m.reactions.isEmpty ? 0 : 12)
+                        .contextMenu {
+                            Button("Open Link") { NSWorkspace.shared.open(link) }
+                            Button("Copy Link") { copy(link.absoluteString) }
+                            Divider()
+                            Button("React in Messages") { openInMessages() }
+                            Button("Reply in Messages") { openInMessages() }
+                            Divider()
+                            Button("Delete…", role: .destructive) { deleting = m }
+                        }
+                    if !m.isFromMe { Spacer(minLength: 90) }
+                }
+                if let status = m.status, showStatus || status == .failed {
+                    Text(status.label)
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(status == .failed ? Color.red : Color.secondary)
+                        .padding(.horizontal, 6)
+                }
+            }
         } else {
-            textBubble(m, text: m.text, previous: previous, showStatus: showStatus)
+            textBubble(m, text: m.caption, previous: previous, showStatus: showStatus)
         }
+    }
+
+    /// The message is only a link (rich-link previews are off for unknown senders, as in Messages).
+    private func linkOnly(_ m: ChatMessage) -> URL? {
+        guard m.isFromMe || chat.isKnown else { return nil }
+        let text = m.caption.trimmed
+        guard let url = Linkify.cached(text).url, !text.contains(" "), !text.contains("\n") else { return nil }
+        return url
     }
 
     /// The message an inline reply answers, from what's loaded or fetched by guid.
@@ -680,8 +988,10 @@ struct ChatDetailView: View {
                           close: { openThread = nil }) {
                 // Click the original: back to it in the conversation, briefly highlighted.
                 openThread = nil
-                guard messages.contains(where: { $0.guid == thread }) else { return }
-                withAnimation { proxy.scrollTo(thread, anchor: .center) }
+                guard let index = messages.firstIndex(where: { $0.guid == thread }) else { return }
+                // Draw back far enough to include it, then go there.
+                rendered = max(rendered, messages.count - index + 10)
+                DispatchQueue.main.async { withAnimation { proxy.scrollTo(thread, anchor: .center) } }
                 highlighted = thread
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) { if highlighted == thread { highlighted = nil } }
             }
@@ -691,13 +1001,6 @@ struct ChatDetailView: View {
 
     private func replyCount(_ m: ChatMessage) -> Int {
         messages.filter { $0.threadOriginator == m.guid }.count
-    }
-
-    private func reactionNote(_ m: ChatMessage) -> String {
-        m.reactions.map { r in
-            let who = r.fromMe ? "You" : (r.sender.map { state.contacts.name(for: $0) ?? ContactsIndex.pretty($0) } ?? "Someone")
-            return "\(who) \(r.verb) this"
-        }.joined(separator: "\n")
     }
 
     @ViewBuilder
@@ -731,9 +1034,9 @@ struct ChatDetailView: View {
         do {
             let link = Linkify.cached(text).url
             Bubble(text: text, fromMe: m.isFromMe, green: m.isTextMessage, sender: senderName(m, previous: previous),
-                   failed: m.status == .failed, tooltip: tooltip(m),
+                   failed: m.status == .failed,
                    // Like Messages, unknown senders don't get rich links: fetching one would tell the sender's server you looked.
-                   preview: m.isFromMe || chat.isKnown ? link : nil, reactions: m.reactions, reactionNote: reactionNote(m)) {
+                   preview: m.isFromMe || chat.isKnown ? link : nil, reactions: m.reactions) {
                 if m.status == .failed {
                     Text("Not Delivered").foregroundStyle(.red)
                 } else if showStatus, let status = m.status {
@@ -797,8 +1100,7 @@ struct ChatDetailView: View {
 
     private func pendingTextRow(_ item: OutgoingMessage) -> some View {
         Bubble(text: item.text, fromMe: true, green: item.asTextMessage || chat.service == "SMS",
-               faded: item.phase == .queued || item.phase == .sending, failed: item.isFailed,
-               tooltip: item.isFailed ? item.phaseLabel : nil) {
+               faded: item.phase == .queued || item.phase == .sending, failed: item.isFailed) {
             PendingStatus(item: item) { undo(item) }
         } actions: {
             if item.isFailed {
@@ -830,12 +1132,6 @@ struct ChatDetailView: View {
         return m.sender.map { state.contacts.name(for: $0) ?? ContactsIndex.pretty($0) } ?? "Someone"
     }
 
-    private func tooltip(_ m: ChatMessage) -> String {
-        let when = m.date.formatted(date: .abbreviated, time: .shortened)
-        guard let status = m.status else { return when }
-        return "\(when) · \(m.isTextMessage ? "Text Message" : "iMessage") · \(status.label)"
-    }
-
     private func undo(_ item: OutgoingMessage) {
         guard let back = state.undoSend(item.id) else { return }
         if let file = back.attachment {
@@ -862,6 +1158,13 @@ struct ChatDetailView: View {
     /// Floats over the transcript in Liquid Glass, like Messages on macOS 26.
     private var composer: some View {
         VStack(spacing: 8) {
+            if state.isEnabled(chat.id), let until = state.aiBlocks[chat.id], until > .now {
+                HoldNotice(until: until, provider: state.config.provider, reason: "lots of texts at once", action: "Resume") {
+                    state.unblockAI(chat.id)
+                }
+            } else if state.isEnabled(chat.id), let until = state.holds[chat.id] {
+                HoldNotice(until: until, provider: state.config.provider) { state.replyNow(chat) }
+            }
             if let deleted = lastDeleted {
                 HStack(spacing: 8) {
                     Label("Message deleted from iMessager", systemImage: "trash")
@@ -906,7 +1209,6 @@ struct ChatDetailView: View {
                             .frame(width: 20, height: 20)
                     }
                     .glassCircleButton()
-                    .help("Add photos, videos or files")
 
                     Button {
                         Task { await generate() }
@@ -919,7 +1221,6 @@ struct ChatDetailView: View {
                     }
                     .glassCircleButton()
                     .disabled(working)
-                    .help("Draft a reply with AI (doesn't send)")
 
                     TextField(aiBusy ? "" : (chat.service == "SMS" ? "Text Message" : "iMessage"), text: $draft, axis: .vertical)
                         .textFieldStyle(.plain)
@@ -954,14 +1255,12 @@ struct ChatDetailView: View {
                             }
                             .glassCircleButton(prominent: true)
                             .tint(.red)
-                            .help("Stop \(state.providerName) and reply yourself")
                         }
                     }
                     .contextMenu {
                         Button("Send as Text Message") { send(asTextMessage: true) }
                             .disabled(!canSend || !canText)
                     }
-                    .help(undoHint)
                 }
             }
         }
@@ -988,20 +1287,16 @@ struct ChatDetailView: View {
         }
     }
 
-    private var undoHint: String {
-        let seconds = Int(state.config.undoSendSeconds)
-        return "Send (↩). Right-click to send as a text message." + (seconds > 0 ? " You can undo for \(seconds)s." : "")
-    }
-
-    private func generate() async {
+    private func generate(todo: String? = nil) async {
         working = true
         defer { working = false }
         do {
-            let d = try await state.preview(chat.id)
+            let d = if let todo { try await state.followUpDraft(chat.id, todo: todo) } else { try await state.preview(chat.id) }
             await typeOut(d.text ?? "")
             info = d.text == nil
                 ? "The AI wouldn't reply here · \(d.ms) ms"
-                : "Drafted in \(d.ms) ms" + (d.tools.isEmpty ? "" : " · used \(Array(Set(d.tools)).sorted().joined(separator: ", "))")
+                : (todo.map { "Follow-up to “\($0)”" } ?? "Drafted in \(d.ms) ms")
+                    + (d.tools.isEmpty ? "" : " · used \(Array(Set(d.tools)).sorted().joined(separator: ", "))")
         } catch {
             info = error.localizedDescription
         }
@@ -1078,7 +1373,6 @@ private struct ReplyQuote: View {
                 }
             }
             .buttonStyle(.plain)
-            .help("Show thread")
             if !fromMe { Spacer(minLength: 120) }
         }
     }
@@ -1130,7 +1424,6 @@ private struct ThreadOverlay: View {
                         bubble(root)
                             .contentShape(Rectangle())
                             .onTapGesture(perform: jump)
-                            .help("Show in conversation")
                     }
                     ForEach(replies) { bubble($0) }
                 }
@@ -1147,7 +1440,6 @@ private struct ThreadOverlay: View {
             }
             .glassCircleButton()
             .keyboardShortcut(.cancelAction)
-            .help("Close (Esc)")
             .padding(14)
         }
     }
@@ -1174,16 +1466,37 @@ private struct ThreadOverlay: View {
     }
 }
 
-/// Messages fade in quickly one after another when a conversation opens, newest first.
-private struct Reveal: ViewModifier {
-    let order: Int
-    let on: Bool
 
-    func body(content: Content) -> some View {
-        content
-            .opacity(on ? 1 : 0)
-            .offset(y: on ? 0 : 6)
-            .animation(order < 24 ? .easeOut(duration: 0.2).delay(Double(order) * 0.018) : nil, value: on)
+/// Above the text bar while the AI holds off: because you texted them yourself, or because they sent a flood of
+/// texts (the spam guard). It disappears when the time's up.
+private struct HoldNotice: View {
+    let until: Date
+    let provider: AIProvider
+    var reason = "you replied yourself"
+    var action = "Reply Now"
+    let replyNow: () -> Void
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 15)) { context in
+            let left = until.timeIntervalSince(context.date)
+            if left > 0 {
+                HStack(spacing: 8) {
+                    if let logo = Brand.providerLogo(provider) {
+                        Image(nsImage: logo).renderingMode(.template).foregroundStyle(Brand.providerColor(provider))
+                    }
+                    Text("\(provider == .claudeCode ? "Claude" : "OpenRouter") is holding off · \(reason) · \(max(1, Int((left / 60).rounded(.up)))) min left")
+                        .foregroundStyle(.secondary)
+                    Button(action, action: replyNow)
+                        .buttonStyle(.plain)
+                        .foregroundStyle(Color.accentColor)
+                        .fontWeight(.semibold)
+                }
+                .font(.caption)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .liquidGlass(in: Capsule())
+            }
+        }
     }
 }
 
@@ -1233,7 +1546,6 @@ private struct TypingBubble: View {
             .padding(.horizontal, 14)
             .padding(.vertical, 11)
             .background(Color(red: 0.04, green: 0.5, blue: 1.0).opacity(0.85), in: RoundedRectangle(cornerRadius: 17, style: .continuous))
-            .help("\(AppState.shared.providerName) is writing a reply")
     }
 }
 
@@ -1276,10 +1588,8 @@ struct Bubble<Footer: View, Actions: View>: View {
     var faded = false
     var sender: String? = nil
     var failed = false
-    var tooltip: String? = nil
     var preview: URL? = nil
     var reactions: [Reaction] = []
-    var reactionNote: String = ""
     @ViewBuilder var footer: () -> Footer
     @ViewBuilder var actions: () -> Actions
 
@@ -1311,12 +1621,10 @@ struct Bubble<Footer: View, Actions: View>: View {
                                     ForEach(Array(reactions.enumerated()), id: \.offset) { _, r in ReactionBadge(reaction: r) }
                                 }
                                 .offset(x: fromMe ? -12 : 12, y: -14)
-                                .help(reactionNote)
                             }
                         }
                         .padding(.top, reactions.isEmpty ? 0 : 12)
                         .contextMenu { actions() }
-                        .help(tooltip ?? "")
                     if failed {
                         Menu {
                             actions()
@@ -1329,7 +1637,6 @@ struct Bubble<Footer: View, Actions: View>: View {
                         .buttonStyle(.plain)
                         .menuIndicator(.hidden)
                         .fixedSize()
-                        .help("Not Delivered")
                     }
                 }
                 if let preview {
@@ -1359,38 +1666,46 @@ struct Avatar: View {
     var handle: String? = nil       // contact photo from Contacts
     var photoPath: String? = nil    // group photo from Messages
     var members: [String] = []      // group members, shown as a cluster when there's no group photo
-    var glass = true                // soft glass edge and float shadow; off for faces inside a group bubble
+    var glass = true                // soft glass edge and glow; off for faces inside a group bubble
     @State private var photo: NSImage?
+    @Environment(\.colorScheme) private var scheme
 
     var body: some View {
         let image = photo ?? AvatarPhotos.cached(handle ?? photoPath)
         Group {
             if isGroup, image == nil, members.count >= 2 {
-                // Members float inside one bubble, like Messages. Real glass only on big (pinned) avatars:
-                // each glass layer samples what's behind it, which adds up across a scrolling list.
-                if size >= 50 {
-                    MemberCluster(members: members, size: size).liquidGlass(in: Circle())
-                } else {
-                    MemberCluster(members: members, size: size)
-                        .background(Color.primary.opacity(0.07), in: Circle())
-                        .overlay { GlassEdge(size: size) }
-                }
+                // Members float inside one dim bubble, like Messages (no glass: it read as a bright rim on dark windows).
+                MemberCluster(members: members, size: size)
+                    .background(Color.primary.opacity(0.07), in: Circle())
+                    .overlay { GlassEdge(size: size) }
             } else {
                 face(image, size: size)
                     .overlay { if glass { GlassEdge(size: size) } }
             }
         }
-        // A float shadow is an extra render pass per avatar, so only pinned and header-sized ones get it.
-        .shadow(color: .black.opacity(glass && size >= 50 ? 0.2 : 0), radius: size * 0.07, y: size * 0.035)
+        // A faint halo in the avatar's own color, like Messages. A gradient, not a blur, so it costs nothing to scroll.
+        .background {
+            if glass {
+                let key = handle ?? photoPath
+                AvatarGlow(color: image != nil ? (AvatarPhotos.tint(key) ?? palette[0]) : palette[0], size: size)
+            }
+        }
         .overlay(alignment: .bottomTrailing) {
             if active {
-                Image(systemName: "bolt.fill")
-                    .font(.system(size: size * 0.22, weight: .bold))
-                    .foregroundStyle(.white)
-                    .frame(width: size * 0.42, height: size * 0.42)
-                    .background(Circle().fill(.green))
-                    .overlay(Circle().strokeBorder(Color(nsColor: .windowBackgroundColor), lineWidth: 1.5))
-                    .offset(x: 2, y: 2)
+                // Auto-reply is on: the logo of the model answering for you.
+                let mark = Brand.replyMark(AppState.shared.config)
+                Group {
+                    if let logo = mark.image {
+                        Image(nsImage: logo).renderingMode(.template).resizable().scaledToFit().padding(size * 0.085)
+                    } else {
+                        Image(systemName: "bolt.fill").font(.system(size: size * 0.22, weight: .bold))
+                    }
+                }
+                .foregroundStyle(.white)
+                .frame(width: size * 0.42, height: size * 0.42)
+                .background(Circle().fill(mark.color))
+                .overlay(Circle().strokeBorder(Color(nsColor: .windowBackgroundColor), lineWidth: 1.5))
+                .offset(x: 2, y: 2)
             }
         }
         .task(id: "\(handle ?? photoPath ?? "")#\(AppState.shared.contactsRevision)") {
@@ -1409,6 +1724,7 @@ struct Avatar: View {
                         .antialiased(true)
                         .scaledToFill()
                         .clipShape(Circle())
+                        .transition(.opacity)
                 } else if isGroup || initials.isEmpty {
                     Image(systemName: isGroup ? "person.2.fill" : "person.fill")
                         .font(.system(size: size * 0.4))
@@ -1420,6 +1736,8 @@ struct Avatar: View {
                 }
             }
             .frame(width: size, height: size)
+            // A photo that arrives after the initials fades in rather than snapping.
+            .animation(.easeOut(duration: 0.18), value: image != nil)
     }
 
     private var initials: String {
@@ -1427,9 +1745,11 @@ struct Avatar: View {
         return title.split(separator: " ").prefix(2).compactMap { $0.first.map(String.init) }.joined().uppercased()
     }
 
-    /// No photo: Messages' gray with white initials. Any color comes from a real photo set in Contacts.
+    /// No photo: Messages' gray with white initials (a deep slate in dark mode). Any color comes from a real photo.
     private var palette: [Color] {
-        [Color(red: 0.64, green: 0.67, blue: 0.73), Color(red: 0.51, green: 0.54, blue: 0.60)]
+        scheme == .dark
+            ? [Color(red: 0.38, green: 0.37, blue: 0.47), Color(red: 0.25, green: 0.24, blue: 0.32)]
+            : [Color(red: 0.64, green: 0.67, blue: 0.73), Color(red: 0.51, green: 0.54, blue: 0.60)]
     }
 
 }
@@ -1484,21 +1804,36 @@ private struct ChatDetails: View {
     }
 }
 
-/// Apple-style edge on an avatar: a soft specular highlight on top fading to a faint shade, never a hard outline.
+/// Apple-style edge on an avatar: a barely-there highlight on top, never a visible rim.
 private struct GlassEdge: View {
     let size: CGFloat
 
     var body: some View {
-        let width = max(1, size * 0.035)
+        let width = max(1, size * 0.03)
         ZStack {
             Circle()
-                .strokeBorder(LinearGradient(colors: [.white.opacity(0.5), .white.opacity(0.12), .clear, .white.opacity(0.08)],
+                .strokeBorder(LinearGradient(colors: [.white.opacity(0.16), .white.opacity(0.04), .clear, .white.opacity(0.03)],
                                              startPoint: .top, endPoint: .bottom), lineWidth: width)
                 .blendMode(.plusLighter)
             Circle()
-                .strokeBorder(Color.black.opacity(0.14), lineWidth: 0.5)
+                .strokeBorder(Color.black.opacity(0.12), lineWidth: 0.5)
         }
         .allowsHitTesting(false)
+    }
+}
+
+/// A very small halo just outside an avatar, in its color.
+private struct AvatarGlow: View {
+    let color: Color
+    let size: CGFloat
+
+    var body: some View {
+        let reach = max(2, size * 0.06)
+        Circle()
+            .fill(RadialGradient(colors: [color.opacity(0.18), color.opacity(0)], center: .center,
+                                 startRadius: size / 2 - 1, endRadius: size / 2 + reach))
+            .frame(width: size + reach * 2, height: size + reach * 2)
+            .allowsHitTesting(false)
     }
 }
 
@@ -1584,11 +1919,17 @@ private struct MemberList: View {
 @MainActor
 enum AvatarPhotos {
     private static var images: [String: NSImage] = [:]
+    /// Each photo's average color, for its glow.
+    private static var tints: [String: Color] = [:]
     private static var missing: Set<String> = []
     private static var inflight: [String: Task<NSImage?, Never>] = [:]
 
     static func cached(_ key: String?) -> NSImage? {
         key.flatMap { images[$0] }
+    }
+
+    static func tint(_ key: String?) -> Color? {
+        key.flatMap { tints[$0] }
     }
 
     /// Contacts changed or finished loading: photos that weren't found before may be there now.
@@ -1620,13 +1961,16 @@ enum AvatarPhotos {
         if let running = inflight[key] { return await running.value }
         let contacts = AppState.shared.contacts
         let task = Task<NSImage?, Never> {
-            let cgImage = await Task.detached(priority: .userInitiated) { () -> CGImage? in
+            let (cgImage, tint) = await Task.detached(priority: .userInitiated) { () -> (CGImage?, Color?) in
                 let file = diskURL(for: key)
-                if let data = try? Data(contentsOf: file), let cached = decode(data, maxPixels: 360) { return cached }
+                if let data = try? Data(contentsOf: file), let cached = decode(data, maxPixels: 360) {
+                    return (cached, averageColor(cached))
+                }
                 let made = render(handle: handle, path: path, contacts: contacts)
                 if let made { writeJPEG(made, to: file) }
-                return made
+                return (made, made.flatMap(averageColor))
             }.value
+            if let tint { tints[key] = tint }
             return cgImage.map { NSImage(cgImage: $0, size: NSSize(width: $0.width, height: $0.height)) }
         }
         inflight[key] = task
@@ -1705,6 +2049,19 @@ private func faceCentered(_ image: CGImage) -> CGImage {
     return image.cropping(to: CGRect(x: x, y: y, width: side, height: side).integral) ?? square(image)
 }
 
+/// The photo's average color, brightened a little so its glow still shows on a dark window.
+private func averageColor(_ image: CGImage) -> Color? {
+    guard let ctx = CGContext(data: nil, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+                              space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+          let raw = ctx.data else { return nil }
+    ctx.interpolationQuality = .medium
+    ctx.draw(image, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+    let px = raw.assumingMemoryBound(to: UInt8.self)
+    let color = NSColor(srgbRed: CGFloat(px[0]) / 255, green: CGFloat(px[1]) / 255, blue: CGFloat(px[2]) / 255, alpha: 1)
+    return Color(nsColor: color.blended(withFraction: 0.15, of: .white) ?? color)
+}
+
 /// Downsample a cropped square to avatar size.
 private func decodeSquare(_ image: CGImage) -> CGImage {
     guard image.width > 360, let ctx = CGContext(data: nil, width: 360, height: 360, bitsPerComponent: 8, bytesPerRow: 0,
@@ -1722,6 +2079,45 @@ private extension View {
         if #available(macOS 15, *) { defaultScrollAnchor(.bottom, for: .sizeChanges) } else { self }
     }
 
+    func springy(_ spring: ScrollSpring) -> some View { modifier(Springy(spring: spring)) }
+
+    func arrives(_ kind: Arrival.Kind?) -> some View { modifier(Arrival(kind: kind)) }
+
+    /// Feeds the scroll position to the springy bubbles.
+    @ViewBuilder
+    func tracksSpeed(_ spring: ScrollSpring) -> some View {
+        if #available(macOS 15, *) {
+            onScrollGeometryChange(for: CGPoint.self) { CGPoint(x: $0.contentSize.height, y: $0.contentOffset.y) } action: { _, new in
+                spring.scrolled(to: new.y, height: new.x)
+            }
+        } else {
+            self
+        }
+    }
+
+    /// The anchor alone doesn't always hold on macOS: a link preview that arrives late can leave the newest message
+    /// below the window. So if you were at the bottom when the transcript grew, it goes back there. Scrolling up near
+    /// the top asks for older messages.
+    @ViewBuilder
+    func followsTranscript(_ proxy: ScrollViewProxy, ready: Bool, nearTop: @escaping () -> Void) -> some View {
+        if #available(macOS 15, *) {
+            onScrollGeometryChange(for: TranscriptPosition.self) { geo in
+                // containerSize already leaves out the insets (toolbar above, composer below).
+                let top = geo.contentOffset.y + geo.contentInsets.top
+                let viewport = geo.containerSize.height
+                return TranscriptPosition(height: geo.contentSize.height, fromTop: top,
+                                          fromBottom: geo.contentSize.height - top - viewport, viewport: viewport)
+            } action: { old, new in
+                guard ready else { return }
+                if new.height != old.height, old.fromBottom < 40 { proxy.scrollTo("bottom", anchor: .bottom) }
+                // Heading up near the top, or the whole thread fits with room to spare.
+                if new.fromTop < 400, new.fromTop < old.fromTop || new.height < new.viewport + 400 { nearTop() }
+            }
+        } else {
+            self
+        }
+    }
+
     /// Small glass capsule floating above the composer.
     func toast() -> some View {
         font(.caption)
@@ -1730,6 +2126,112 @@ private extension View {
             .padding(.vertical, 6)
             .liquidGlass(in: Capsule())
     }
+}
+
+/// iMessage's springy bubbles: while you scroll, bubbles trail behind in proportion to how far they are from the
+/// pointer, so the gaps between them stretch with speed, then they catch up with a little bounce (which is also what
+/// you see when a scroll hits the top or bottom). A small spring simulation that only runs while something moves.
+@MainActor @Observable
+final class ScrollSpring {
+    /// How far behind the bubbles are, as a scroll speed (points per second) springing toward the real one.
+    private(set) var lag: CGFloat = 0
+    /// The pointer's height in the transcript; bubbles there don't trail at all.
+    @ObservationIgnored var anchor: CGFloat?
+    @ObservationIgnored private var lagSpeed: CGFloat = 0
+    @ObservationIgnored private var target: CGFloat = 0
+    @ObservationIgnored private var lastOffset: CGFloat?
+    @ObservationIgnored private var lastTime: CFTimeInterval = 0
+    @ObservationIgnored private var lastInput: CFTimeInterval = 0
+    @ObservationIgnored private var lastTick: CFTimeInterval = 0
+    @ObservationIgnored private var lastHeight: CGFloat = 0
+    @ObservationIgnored private var resized: CFTimeInterval = 0
+    @ObservationIgnored private var timer: Timer?
+
+    func scrolled(to offset: CGFloat, height: CGFloat) {
+        let now = CACurrentMediaTime()
+        defer { lastOffset = offset; lastTime = now; lastHeight = height }
+        if height != lastHeight { resized = now }
+        guard let last = lastOffset else { return }
+        let dt = now - lastTime
+        let delta = offset - last
+        // Jumps (opening a chat, going to a message) and the app keeping you at the bottom as a new message or
+        // a link preview comes in aren't you scrolling.
+        guard dt > 0.001, abs(delta) < 120, now - resized > 0.15 else { return }
+        target = target * 0.35 + max(-5000, min(5000, delta / dt)) * 0.65
+        lastInput = now
+        guard timer == nil else { return }
+        lastTick = now
+        let timer = Timer(timeInterval: 1 / 120, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.tick() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+    }
+
+    private func tick() {
+        let now = CACurrentMediaTime()
+        let dt = min(1 / 30, now - lastTick)
+        lastTick = now
+        if now - lastInput > 0.05 { target = 0 }   // stopped, or ran into the end
+        // Loose enough to trail visibly, underdamped so it settles with a clear bounce.
+        lagSpeed += (160 * (target - lag) - 12.5 * lagSpeed) * dt
+        lag += lagSpeed * dt
+        if target == 0, abs(lag) < 3, abs(lagSpeed) < 30 {
+            lag = 0
+            lagSpeed = 0
+            timer?.invalidate()
+            timer = nil
+        }
+    }
+}
+
+private struct Springy: ViewModifier {
+    let spring: ScrollSpring
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    func body(content: Content) -> some View {
+        let lag = reduceMotion ? 0 : spring.lag
+        let anchor = spring.anchor
+        content.visualEffect { effect, proxy in
+            let height = proxy.bounds(of: .scrollView)?.height ?? 600
+            let distance = abs(proxy.frame(in: .scrollView).midY - (anchor ?? height * 0.6))
+            let shift = lag * 0.000038 * distance
+            let limit = min(110, distance * 0.24)
+            return effect.offset(y: max(-limit, min(limit, shift)))
+        }
+    }
+}
+
+/// iMessage's arrival animations: a text you send (or the AI sends) rises from the text bar into place; one you
+/// receive pops up from the bottom corner. Only bubbles that arrive while the conversation is open animate.
+private struct Arrival: ViewModifier {
+    enum Kind { case sent, received }
+    let kind: Kind?
+    @State private var arrived = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    func body(content: Content) -> some View {
+        let still = kind == nil || reduceMotion || arrived
+        let sent = kind == .sent
+        content
+            .scaleEffect(still ? 1 : (sent ? 0.84 : 0.5), anchor: sent ? .bottomTrailing : .bottomLeading)
+            .offset(y: still ? 0 : (sent ? 52 : 16))
+            .opacity(still ? 1 : 0)
+            .onAppear {
+                guard kind != nil, !arrived else { return }
+                withAnimation(sent ? .spring(response: 0.4, dampingFraction: 0.78) : .spring(response: 0.42, dampingFraction: 0.62)) {
+                    arrived = true
+                }
+            }
+    }
+}
+
+/// How tall the transcript is and how far you are from its top and bottom.
+private struct TranscriptPosition: Equatable {
+    var height: CGFloat
+    var fromTop: CGFloat
+    var fromBottom: CGFloat
+    var viewport: CGFloat
 }
 
 enum Fmt {

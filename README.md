@@ -13,6 +13,8 @@ A native macOS app that answers your iMessages with an OpenRouter model. You swi
 - **Undo send, Try Again, Send as Text Message, Delete.** Messages has no scripting for unsend or delete, so iMessager holds each text for a few seconds (Settings › Behavior) before handing it to Messages; Undo pulls it back. Delete removes a message from iMessager and from what the AI sees; it stays in Messages on your devices. Failed texts get the red "!" with Try Again and Send as Text Message.
 - **Notifications and ads stay out of the way.** Payment alerts, login codes, deliveries and "reply STOP" marketing are sorted into Transactions and Promotions automatically. Right-click a chat to move it.
 - **Use your Claude plan.** Settings › AI › Claude plan runs your own Claude Code (`claude -p`) for each reply, the way Anthropic supports subscription use. iMessager never sees your Claude login, and each call runs with Claude Code's tools, MCP servers, hooks and settings switched off, in an empty folder, so a text can't make it touch your Mac. (Tools such as calendar search need OpenRouter.)
+- **Auto-reply for everyone (optional).** One switch in Settings covers every person you text (in Contacts or texted before); groups, new numbers, codes and promotions stay opt-in, and any chat can be switched off from its button.
+- **Replies that read the room.** The AI answers as you, reads further back in the conversation when a text doesn't make sense on its own, and never sends "I'm an AI, I can't respond": a reply like that is retried with more history, then dropped.
 - **New Message (⌘N).** Search your Contacts or type a number or email; if you already have a conversation with them it opens.
 - **Photos, videos and files.** Send them from Photos, Finder, paste (⌘V) or drag-and-drop; received ones show inline. Right-click to open, copy or show in Finder, or drag them out.
 - **Unread summaries and notifications.** A one-line AI summary for conversations with several unread texts, and notifications when the AI replies, greets someone, or a text fails (with Try Again).
@@ -69,6 +71,7 @@ chat.db ──FSEvents──▶ Agent ──▶ debounce per chat ──▶ cont
 | Contacts | A `lookup_contact` tool: birthdays, companies, cities |
 | Notes Folder | `.md`/`.txt` files: the whole folder if it's small, otherwise a search tool |
 | Webhook / API | A tool that sends `{"query": …}` to your URL (Zapier, n8n, your server) |
+| MCP Server (remote) | A hosted MCP server by URL and token (Streamable HTTP): GitHub, Guava CRM, Linear… Quick-add presets for GitHub and Guava; Google Calendar comes through Calendar once the account is in Internet Accounts. |
 | MCP Server | Every tool from any stdio MCP server, e.g. `npx -y @modelcontextprotocol/server-memory` |
 | Web Search | A `web_search` tool through OpenRouter's web plugin |
 

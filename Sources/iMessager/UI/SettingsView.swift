@@ -9,6 +9,69 @@ struct SettingsView: View {
     @State private var claudeTest = ""
     @State private var testingClaude = false
 
+    /// Spam and spending guards, with defaults that are safe to leave alone.
+    private var limitsSection: some View {
+        @Bindable var state = state
+        let limits = state.config.limits
+        let today = state.config.stats.day == Date.now.formatted(.iso8601.year().month().day())
+        return Section {
+            LabeledContent("Replies per chat") {
+                Stepper("\(state.config.maxRepliesPerHour) per hour", value: $state.config.maxRepliesPerHour, in: 1...120)
+            }
+            LabeledContent("Replies per group chat") {
+                Stepper("\(limits.groupRepliesPerHour) per hour", value: $state.config.limits.groupRepliesPerHour, in: 1...60)
+            }
+            LabeledContent("Time between replies in a chat") {
+                Stepper(limits.secondsBetweenReplies > 0 ? "\(Int(limits.secondsBetweenReplies)) sec" : "None",
+                        value: $state.config.limits.secondsBetweenReplies, in: 0...600, step: 10)
+            }
+            LabeledContent("Replies across all chats") {
+                Stepper("\(limits.repliesPerHourAllChats) per hour", value: $state.config.limits.repliesPerHourAllChats, in: 5...500, step: 5)
+            }
+            LabeledContent("Automatic AI calls per day") {
+                Stepper("\(limits.autoCallsPerDay)", value: $state.config.limits.autoCallsPerDay, in: 25...5000, step: 25)
+            }
+            if state.config.provider == .openRouter {
+                LabeledContent("OpenRouter spend per day") {
+                    Stepper(limits.dailySpendUSD > 0 ? String(format: "$%.2f", limits.dailySpendUSD) : "No limit",
+                            value: $state.config.limits.dailySpendUSD, in: 0...100, step: 0.5)
+                }
+            }
+            LabeledContent("Spam guard") {
+                HStack(spacing: 14) {
+                    Stepper("\(limits.floodTexts) texts", value: $state.config.limits.floodTexts, in: 3...100)
+                    Stepper("in \(Int(limits.floodMinutes)) min", value: $state.config.limits.floodMinutes, in: 1...30)
+                }
+            }
+            LabeledContent("Then pause auto-reply in that chat for") {
+                Stepper("\(Int(limits.blockMinutes)) min", value: $state.config.limits.blockMinutes, in: 5...1440, step: 5)
+            }
+            HStack {
+                Text("Today: \(today ? state.config.stats.autoCallsToday : 0) automatic AI calls"
+                     + (state.config.provider == .openRouter ? String(format: " · $%.2f", today ? state.config.stats.spentToday : 0) : ""))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Reset to Defaults") {
+                    state.config.limits = .defaults
+                    state.config.maxRepliesPerHour = AppConfig().maxRepliesPerHour
+                }
+                .disabled(limits == .defaults && state.config.maxRepliesPerHour == AppConfig().maxRepliesPerHour)
+            }
+        } header: {
+            Text("Limits")
+        } footer: {
+            Text("Keeps someone spamming you, or a very busy group, from using up your AI. Only automatic replies, greetings, summaries and the scheduled recap count; anything you start yourself always runs.")
+                .font(.caption)
+        }
+        .monospacedDigit()
+    }
+
+    static func hourName(_ hour: Int) -> String {
+        let date = Calendar.current.date(bySettingHour: hour, minute: 0, second: 0, of: .now) ?? .now
+        return date.formatted(date: .omitted, time: .shortened)
+    }
+
     var body: some View {
         @Bindable var state = state
         GeometryReader { geo in
@@ -18,7 +81,14 @@ struct SettingsView: View {
                         ForEach(AppearanceMode.allCases) { Text($0.title).tag($0) }
                     }
                     .pickerStyle(.segmented)
-                    .help("Automatic follows your Mac's light and dark schedule")
+                    LabeledContent("Transparency") {
+                        HStack(spacing: 10) {
+                            Text("Solid").font(.caption).foregroundStyle(.secondary)
+                            Slider(value: $state.config.transparency, in: 0...1)
+                                .frame(width: 200)
+                            Text("Clear").font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
                     Toggle(isOn: $state.config.hideAutomated) {
                         Text("Keep transactions and promotions out of Messages")
                         Text("Payment alerts, codes and texts with “reply STOP” go to their own filters. Right-click a chat to move it.")
@@ -31,9 +101,41 @@ struct SettingsView: View {
                         Text("Claude plan (Claude Code)").tag(AIProvider.claudeCode)
                     }
                     .pickerStyle(.segmented)
+                    Toggle(isOn: $state.config.autoReplyEveryone) {
+                        Text("Auto-reply for everyone")
+                        Text("The AI answers every person you text (in your Contacts or someone you've texted before). New numbers, codes and promotions stay off. Switch any chat off from its button at the top right.")
+                    }
+                    Toggle(isOn: $state.config.autoReplyGroups) {
+                        Text("Auto-reply in every group chat")
+                        Text("The AI joins in when someone talks to you or a reply is clearly natural, and otherwise stays quiet. At most \(state.config.limits.groupRepliesPerHour) replies per group an hour (Limits below). Switch any group off from its button at the top right.")
+                    }
                     Toggle(isOn: $state.config.summarizeUnread) {
                         Text("Summarize unread conversations")
                         Text("A one-line summary in the list when several texts are waiting. Sends those unread texts to the AI above.")
+                    }
+                    Toggle(isOn: $state.config.recap.enabled) {
+                        Text("Daily recap on Home")
+                        Text("Once a day, a few lines about your texts and a checklist of what you said you'd do. Sends the last day of texts in your main list to the AI above.")
+                    }
+                    if state.config.recap.enabled {
+                        Picker(selection: $state.config.recap.onCheck) {
+                            Text("Write a reply for me to send").tag(TodoAction.draft)
+                            Text("Send a reply automatically").tag(TodoAction.send)
+                            Text("Just check it off").tag(TodoAction.nothing)
+                        } label: {
+                            Text("Checking off a to-do")
+                            Text(state.config.recap.onCheck == .send
+                                 ? "The AI writes the follow-up and sends it in the background. You can still undo it for \(Int(state.config.undoSendSeconds))s from the conversation."
+                                 : "Opens the conversation with a follow-up written in the message box, ready for you to send.")
+                        }
+                        Picker("Write it at", selection: $state.config.recap.hour) {
+                            Section("Morning (covers yesterday)") {
+                                ForEach([6, 7, 8, 9, 10], id: \.self) { Text(Self.hourName($0)).tag($0) }
+                            }
+                            Section("Night (covers today)") {
+                                ForEach([18, 20, 21, 22, 23], id: \.self) { Text(Self.hourName($0)).tag($0) }
+                            }
+                        }
                     }
                 } header: {
                     Text("AI")
@@ -121,13 +223,8 @@ struct SettingsView: View {
                                 .frame(width: 40, alignment: .trailing)
                         }
                     }
-                    .help("Lets people finish a burst of texts. Any new text restarts the reply anyway.")
                     LabeledContent("History in each prompt") {
                         Stepper("\(state.config.historyLimit) messages", value: $state.config.historyLimit, in: 5...150, step: 5)
-                            .monospacedDigit()
-                    }
-                    LabeledContent("Max replies per chat") {
-                        Stepper("\(state.config.maxRepliesPerHour) per hour", value: $state.config.maxRepliesPerHour, in: 1...120)
                             .monospacedDigit()
                     }
                     LabeledContent("Pause after you reply yourself") {
@@ -149,6 +246,8 @@ struct SettingsView: View {
                         Text("Draft replies in Activity but never send them")
                     }
                 }
+
+                limitsSection
 
                 Section {
                     Toggle(isOn: $state.config.greeter.enabled) {
@@ -188,11 +287,36 @@ struct SettingsView: View {
                     }
                     Toggle(isOn: $state.config.notifications.incoming) {
                         Text("New messages")
-                        Text("Like Messages: sender, text, their photo, Reply and Mark as Read. Muted conversations, transactions and promotions stay quiet.")
+                        Text("Like Messages: sender, text and their photo, with Reply, Reply with \(state.config.provider == .claudeCode ? "Claude" : "AI") (works even when auto-reply is off) and Mark as Read. Muted conversations, transactions and promotions stay quiet.")
                     }
                     Toggle("Show message previews", isOn: $state.config.notifications.previews)
                         .disabled(!state.config.notifications.incoming)
-                    Toggle("When the AI replies for you", isOn: $state.config.notifications.aiReplies)
+                    LabeledContent("Messages' own notifications") {
+                        Button("Turn Off in System Settings…") { state.openMessagesNotificationSettings() }
+                    }
+                    Toggle(isOn: $state.config.syncReadWithMessages) {
+                        Text("Sync read status with Messages")
+                        Text(MessagesSync.allowed
+                             ? "Reading a chat here marks it read in Messages and on your devices (read receipts go out if you send them)."
+                             : "Needs Accessibility permission for iMessager.")
+                    }
+                    if state.config.syncReadWithMessages && !MessagesSync.allowed {
+                        HStack {
+                            Button("Allow Accessibility…") { MessagesSync.requestPermission() }
+                            Button("Open Settings") { state.openPrivacyPane("Privacy_Accessibility") }
+                        }
+                    }
+                    Toggle(isOn: $state.config.notifications.aiReplies) {
+                        Text("When the AI replies for you")
+                        Text("Only while iMessager isn't the app in front. The reply waits a moment first, with Undo in the notification.")
+                    }
+                    if state.config.notifications.aiReplies {
+                        LabeledContent("Time to undo from the notification") {
+                            Stepper(state.config.aiUndoSeconds > 0 ? "\(Int(state.config.aiUndoSeconds)) sec" : "Off",
+                                    value: $state.config.aiUndoSeconds, in: 0...60, step: 5)
+                                .monospacedDigit()
+                        }
+                    }
                     Toggle("When a new contact is greeted", isOn: $state.config.notifications.greetings)
                     Toggle("When a text couldn't be sent", isOn: $state.config.notifications.failures)
                     Toggle("Dry-run drafts", isOn: $state.config.notifications.drafts)

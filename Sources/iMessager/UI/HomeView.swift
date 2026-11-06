@@ -12,6 +12,7 @@ struct HomeView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
                 header
+                if state.config.recap.enabled { RecapCard() }
                 if let stats {
                     tiles(stats)
                     chart(stats)
@@ -29,6 +30,7 @@ struct HomeView: View {
             if let fresh = try? await state.db.stats(days: range) { stats = fresh }
         }
         .task { await state.refreshCredits() }
+        .task { state.recapIfDue() }
     }
 
     // MARK: Header
@@ -253,6 +255,131 @@ private struct StatTile: View {
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
         .modifier(HomeCard(radius: 18))
+    }
+}
+
+/// The day's texts in a few lines, and a checklist of what you said you'd do. Regenerate any time.
+private struct RecapCard: View {
+    @Environment(AppState.self) private var state
+
+    var body: some View {
+        let recap = state.config.lastRecap
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: state.config.recap.hour >= 17 ? "moon.stars.fill" : "sun.horizon.fill")
+                    .foregroundStyle(state.config.recap.hour >= 17 ? Color.indigo : Color.orange)
+                Text("Daily recap").font(.headline)
+                if let recap {
+                    Text("· last 24 hours, as of \(recap.made.formatted(.dateTime.weekday(.abbreviated).hour().minute()))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button {
+                    Task { await state.makeRecap() }
+                } label: {
+                    HStack(spacing: 5) {
+                        if state.makingRecap {
+                            ProgressView().controlSize(.mini)
+                        } else {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                        Text(state.makingRecap ? "Writing…" : "Regenerate")
+                    }
+                    .font(.caption.weight(.medium))
+                }
+                .glassButtonStyle()
+                .controlSize(.small)
+                .disabled(state.makingRecap || !state.aiReady)
+            }
+            if let recap {
+                Text(recap.summary)
+                    .font(.callout)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                    .opacity(state.makingRecap ? 0.5 : 1)
+                if !recap.todos.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(recap.todos) { todo in TodoRow(todo: todo) }
+                    }
+                    .padding(.top, 2)
+                }
+            } else {
+                Text(state.makingRecap ? "Reading the last day of texts…"
+                     : state.aiReady ? "Your recap is written at \(hourLabel) each day. Click Regenerate for one now."
+                     : "Connect Claude or OpenRouter in Settings to get a daily recap.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .modifier(HomeCard(radius: 18))
+        .animation(.easeOut(duration: 0.2), value: recap)
+    }
+
+    private var hourLabel: String {
+        let date = Calendar.current.date(bySettingHour: state.config.recap.hour, minute: 0, second: 0, of: .now) ?? .now
+        return date.formatted(date: .omitted, time: .shortened)
+    }
+
+}
+
+/// One thing to do: check it off here; click the words to open that conversation.
+private struct TodoRow: View {
+    @Environment(AppState.self) private var state
+    let todo: Recap.Todo
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Button { withAnimation(.snappy) { state.toggleTodo(todo.id) } } label: {
+                Group {
+                    if state.followingUp.contains(todo.id) {
+                        ProgressView().controlSize(.mini)
+                    } else {
+                        Image(systemName: todo.done ? "checkmark.circle.fill" : "circle")
+                            .foregroundStyle(todo.done ? Color.accentColor : Color.secondary)
+                    }
+                }
+                .font(.system(size: 14))
+                .frame(width: 16)
+            }
+            .buttonStyle(.plain)
+            VStack(alignment: .leading, spacing: 2) {
+                Button {
+                    if let chat = todo.chat { state.openRequest = chat }
+                } label: {
+                    Text(todo.text)
+                        .font(.callout)
+                        .strikethrough(todo.done)
+                        .foregroundStyle(todo.done ? .secondary : .primary)
+                        .multilineTextAlignment(.leading)
+                }
+                .buttonStyle(.plain)
+                .disabled(todo.chat == nil)
+                if state.followingUp.contains(todo.id) {
+                    Text("Writing a reply…").font(.caption).foregroundStyle(.secondary)
+                } else if let reply = todo.reply {
+                    Text("Replied: \(reply)").font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                }
+            }
+        }
+        .contextMenu {
+            if todo.done {
+                Button("Mark as Not Done") { state.toggleTodo(todo.id) }
+            } else {
+                if todo.chat != nil, state.config.recap.onCheck != .nothing {
+                    Button("Check Off Without Replying") { withAnimation(.snappy) { state.toggleTodo(todo.id, reply: false) } }
+                }
+                Button(todo.chat != nil && state.config.recap.onCheck != .nothing ? "Check Off and Reply" : "Check Off") {
+                    withAnimation(.snappy) { state.toggleTodo(todo.id) }
+                }
+            }
+            if let chat = todo.chat {
+                Divider()
+                Button("Open Conversation") { state.openRequest = chat }
+            }
+        }
     }
 }
 

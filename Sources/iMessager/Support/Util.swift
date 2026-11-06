@@ -74,3 +74,36 @@ final class LineSplitter: @unchecked Sendable {
         }
     }
 }
+
+/// Keeping iMessager responsive in the background, including the short "dark wakes" a sleeping Mac does when a text
+/// arrives (that's how Messages can ring with the lid closed).
+enum Wakefulness {
+    private final class Token: @unchecked Sendable {
+        let activity: NSObjectProtocol
+        init(_ activity: NSObjectProtocol) { self.activity = activity }
+    }
+
+    nonisolated(unsafe) private static var background: NSObjectProtocol?
+
+    /// No App Nap: a hidden window shouldn't make iMessager slow to notice new texts. Doesn't keep the Mac awake.
+    static func stayResponsive() {
+        guard background == nil else { return }
+        background = ProcessInfo.processInfo.beginActivity(options: .userInitiatedAllowingIdleSystemSleep,
+                                                           reason: "Watching Messages for new texts")
+    }
+
+    /// While handling a text (notify, write, send), ask macOS not to drop back to sleep before it's done.
+    /// Ends when the work does, or after `limit` seconds at most.
+    static func whileHandling<T: Sendable>(limit: Double = 90, _ work: () async throws -> T) async rethrows -> T {
+        let token = Token(ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .idleSystemSleepDisabled],
+                                                                reason: "Replying to a text"))
+        let cap = DispatchWorkItem { ProcessInfo.processInfo.endActivity(token.activity) }
+        DispatchQueue.global().asyncAfter(deadline: .now() + limit, execute: cap)
+        defer {
+            // A few more seconds so the outbox can hand the reply to Messages.
+            cap.cancel()
+            DispatchQueue.global().asyncAfter(deadline: .now() + 8) { ProcessInfo.processInfo.endActivity(token.activity) }
+        }
+        return try await work()
+    }
+}

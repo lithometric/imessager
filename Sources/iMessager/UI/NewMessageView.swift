@@ -52,7 +52,6 @@ struct NewMessageView: View {
                         Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
                     }
                     .buttonStyle(.plain)
-                    .help("Remove")
                 }
                 .padding(.leading, 10)
                 .padding(.trailing, 6)

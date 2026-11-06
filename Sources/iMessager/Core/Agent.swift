@@ -4,6 +4,8 @@ struct Draft: Sendable {
     var text: String?
     var tools: [String] = []
     var ms = 0
+    /// The AI only managed an "I'm an AI / I can't respond" kind of answer, so nothing should be sent.
+    var refused = false
 }
 
 /// The conversation one reply is for. Previews can't act: their tools would send for real.
@@ -14,6 +16,10 @@ private struct Turn: Sendable {
     let canAct: Bool
     let dryRun: Bool
     let maxPerHour: Int
+    /// What this text is for, when it isn't simply the next reply (a to-do you checked off).
+    var task: String? = nil
+    /// You asked for this reply (Reply Now, a notification's Reply button), so the spam limits don't apply.
+    var userAsked = false
 }
 
 /// The harness. Watches chat.db, debounces bursts per conversation, gathers context in parallel,
@@ -68,6 +74,14 @@ actor Agent {
 
     static let actionTools = [sendTool, retryTool, undoTool, deleteTool]
 
+    static let earlierTool = ToolSpec(
+        name: "read_earlier_messages",
+        description: "Read the messages that came before the ones shown, to understand what they're talking about. "
+            + "Use this whenever the latest text doesn't make sense on its own, before replying.",
+        parameters: ["type": "object", "properties": [
+            "count": ["type": "integer", "description": "How many earlier messages to read (default 60, max 200)"],
+        ]])
+
     private let state: AppState
     private let db: ChatDB
     private let contacts: ContactsIndex
@@ -85,6 +99,9 @@ actor Agent {
     private var echoes: [String: [(text: String, at: Date)]] = [:]
     private var replies: [String: [Date]] = [:]
     private var manualUntil: [String: Date] = [:]
+    /// When each chat's recent texts came in, to spot a flood; and chats paused because of one.
+    private var incoming: [String: [Date]] = [:]
+    private var blockedUntil: [String: Date] = [:]
     private var greeted: Set<String> = []
 
     init(state: AppState, db: ChatDB, contacts: ContactsIndex, hub: IntegrationHub, llm: OpenRouterClient, claude: ClaudeCode) {
@@ -145,7 +162,7 @@ actor Agent {
     private func route(_ m: ChatMessage) async {
         // Notify for new texts and tapbacks, like Messages.
         if !m.isFromMe, m.itemType == 0, m.associatedType == 0 || (2000...2007).contains(m.associatedType) {
-            await state.notifyIncoming(m)
+            await Wakefulness.whileHandling(limit: 20) { await state.notifyIncoming(m) }
         }
         guard m.itemType == 0, m.associatedType == 0, let key = m.chatIdentifier, let guid = m.chatGUID else { return }
 
@@ -153,7 +170,7 @@ actor Agent {
             if takeEcho(key, m.text) { return }
             // You texted yourself (here or from your phone): step back.
             let pause = await state.config.pauseAfterManualMinutes
-            if pause > 0 { manualUntil[key] = Date().addingTimeInterval(pause * 60) }
+            if pause > 0 { await hold(key, until: Date().addingTimeInterval(pause * 60)) }
             if let p = pending.removeValue(forKey: key) {
                 p.task.cancel()
                 await state.log(.info, key, "You replied yourself, so the AI reply was cancelled")
@@ -164,15 +181,30 @@ actor Agent {
         guard !m.text.isEmpty else { return }
         let config = await state.config
 
-        if config.contacts[key]?.enabled == true {
+        if await state.autoReplies(to: key, isGroup: m.isGroup) {
             await state.log(.received, key, m.text)
+            let limits = config.limits
+            let now = Date()
+            if let until = blockedUntil[key], until > now {
+                await state.log(.skipped, key, "Auto-reply is paused here for \(Int(until.timeIntervalSince(now) / 60) + 1) more min (too many texts at once)")
+                return
+            }
+            if flooded(key, limits, now) {
+                let until = now.addingTimeInterval(limits.blockMinutes * 60)
+                blockedUntil[key] = until
+                pending.removeValue(forKey: key)?.task.cancel()
+                await state.blockAI(key, until: until, texts: limits.floodTexts, minutes: limits.floodMinutes)
+                return
+            }
             if let until = manualUntil[key], until > Date() {
                 await state.log(.skipped, key, "Paused for \(Int(until.timeIntervalSinceNow / 60) + 1) more min because you replied yourself")
                 return
             }
             let turn = Turn(key: key, guid: guid, handle: m.isGroup ? nil : m.sender, canAct: true, dryRun: config.dryRun,
-                            maxPerHour: config.maxRepliesPerHour)
-            schedule(key, delay: config.replyDelay) { await $0.reply(turn) }
+                            maxPerHour: m.isGroup ? limits.groupRepliesPerHour : config.maxRepliesPerHour)
+            // Not more often than the gap between replies: texts that come sooner get one answer when it's up.
+            let sinceLast = replies[key]?.last.map { now.timeIntervalSince($0) } ?? .infinity
+            schedule(key, delay: max(config.replyDelay, limits.secondsBetweenReplies - sinceLast)) { await $0.reply(turn) }
         } else if config.greeter.enabled, !m.isGroup, let handle = m.sender, !greeted.contains(key),
                   await isNewContact(handle: handle, key: key) {
             await state.log(.received, key, m.text)
@@ -184,10 +216,13 @@ actor Agent {
         pending[key]?.task.cancel()
         let id = UUID()
         let task = Task { [weak self] in
-            if delay > 0 { try? await Task.sleep(for: .seconds(delay)) }
-            guard !Task.isCancelled, let self else { return }
-            await work(self)
-            await self.finish(key, id)
+            // If this text woke a sleeping Mac (a "dark wake"), stay up from its arrival until the reply is sent.
+            await Wakefulness.whileHandling {
+                if delay > 0 { try? await Task.sleep(for: .seconds(delay)) }
+                guard !Task.isCancelled, let self else { return }
+                await work(self)
+                await self.finish(key, id)
+            }
         }
         pending[key] = (id, task)
     }
@@ -207,19 +242,27 @@ actor Agent {
                             ? "Claude Code isn't ready. Check Settings › AI." : "Add your OpenRouter API key in Settings")
             return
         }
-        guard underRateLimit(key, config.maxRepliesPerHour) else {
-            await state.log(.skipped, key, "Hit the limit of \(config.maxRepliesPerHour) replies per hour for this chat")
-            return
+        if !turn.userAsked {
+            guard underRateLimit(key, turn.maxPerHour) else {
+                await state.log(.skipped, key, "Hit the limit of \(turn.maxPerHour) replies per hour for this \(turn.handle == nil ? "group" : "chat")")
+                return
+            }
+            guard underGlobalLimit(config.limits.repliesPerHourAllChats) else {
+                await state.log(.skipped, key, "Hit the limit of \(config.limits.repliesPerHourAllChats) AI replies per hour across all chats")
+                return
+            }
+            guard await state.allowAutomatic("reply", chat: key) else { return }
         }
         // "Claude is replying…" in the text bar until the reply is handed to the outbox (or dropped).
         let token = await state.beginReplying(key)
         defer { Task { [state] in await state.endReplying(key, token) } }
         do {
-            let draft = try await compose(turn, config: config, apiKey: apiKey)
+            let draft = try await composeChecked(turn, config: config, apiKey: apiKey)
             try Task.checkCancellation()
             guard let text = draft.text else {
-                await state.log(.skipped, key, draft.tools.isEmpty ? "AI decided no reply was needed" : "AI finished with tools only",
-                                ms: draft.ms, detail: Self.toolNote(draft.tools))
+                let why = draft.refused ? "AI couldn't come up with a natural reply even after reading further back, so nothing was sent"
+                    : draft.tools.isEmpty ? "AI decided no reply was needed" : "AI finished with tools only"
+                await state.log(.skipped, key, why, ms: draft.ms, detail: Self.toolNote(draft.tools))
                 return
             }
             await deliver(text, key: key, guid: turn.guid, handle: turn.handle, dryRun: config.dryRun, tools: draft.tools, ms: draft.ms)
@@ -231,7 +274,8 @@ actor Agent {
     private func greet(key: String, guid: String, handle: String) async {
         let config = await state.config
         let apiKey = await state.apiKey
-        guard await state.aiReady, underRateLimit(key, config.maxRepliesPerHour) else { return }
+        guard await state.aiReady, underRateLimit(key, config.maxRepliesPerHour),
+              underGlobalLimit(config.limits.repliesPerHourAllChats), await state.allowAutomatic("greeting", chat: key) else { return }
         let token = await state.beginReplying(key)
         defer { Task { [state] in await state.endReplying(key, token) } }
         let clock = ContinuousClock()
@@ -311,7 +355,25 @@ actor Agent {
             throw AppError(config.provider == .claudeCode ? "Claude Code isn't ready. Check Settings › AI." : "Add your OpenRouter API key in Settings first.")
         }
         let turn = Turn(key: key, guid: "", handle: nil, canAct: false, dryRun: true, maxPerHour: config.maxRepliesPerHour)
-        return try await compose(turn, config: config, apiKey: apiKey)
+        return try await composeChecked(turn, config: config, apiKey: apiKey)
+    }
+
+    /// The text that follows up on a to-do you checked off in the daily recap, written for the conversation it came
+    /// from. A draft only: whoever asked for it decides whether it goes out.
+    func followUp(key: String, todo: String) async throws -> Draft {
+        let apiKey = await state.apiKey
+        let config = await state.config
+        guard await state.aiReady else {
+            throw AppError(config.provider == .claudeCode ? "Claude Code isn't ready. Check Settings › AI." : "Add your OpenRouter API key in Settings first.")
+        }
+        let task = """
+        I just checked this off my to-do list: "\(todo)". Write the text I'd send in this conversation now to follow up \
+        on it: answer what they asked, confirm it's handled, or give them the update. Don't make up specifics (times, \
+        places, amounts, links) that aren't in the conversation or my context. This time always write a text; never \
+        output NO_REPLY.
+        """
+        let turn = Turn(key: key, guid: "", handle: nil, canAct: false, dryRun: true, maxPerHour: config.maxRepliesPerHour, task: task)
+        return try await composeChecked(turn, config: config, apiKey: apiKey)
     }
 
     /// One-line summary of unread texts for the conversation list, like Apple's notification summaries.
@@ -348,11 +410,40 @@ actor Agent {
     /// You're sending from iMessager: same as replying from your phone, so any pending AI reply is dropped.
     func userIsReplying(_ key: String) async {
         let pause = await state.config.pauseAfterManualMinutes
-        if pause > 0 { manualUntil[key] = Date().addingTimeInterval(pause * 60) }
+        if pause > 0 { await hold(key, until: Date().addingTimeInterval(pause * 60)) }
         if let p = pending.removeValue(forKey: key) {
             p.task.cancel()
             await state.log(.info, key, "You replied yourself, so the AI reply was cancelled")
         }
+    }
+
+    /// After you text someone yourself, the AI holds off on that chat for a while. The chat shows it.
+    private func hold(_ key: String, until: Date) async {
+        manualUntil[key] = until
+        await state.setHold(key, until: until)
+    }
+
+    /// Ends the hold. With `answer`, replies now if their latest text is recent and still unanswered.
+    func resume(_ key: String, guid: String, handle: String?, answer: Bool) async {
+        manualUntil[key] = nil
+        await state.setHold(key, until: nil)
+        guard answer, pending[key] == nil,
+              let last = try? await db.history(identifier: key, limit: 1).last,
+              !last.isFromMe, last.date > Date().addingTimeInterval(-30 * 60) else { return }
+        let config = await state.config
+        let turn = Turn(key: key, guid: guid, handle: handle, canAct: true, dryRun: config.dryRun, maxPerHour: config.maxRepliesPerHour,
+                        userAsked: true)
+        await state.log(.info, key, "Answering their latest text now")
+        schedule(key, delay: 0) { await $0.reply(turn) }
+    }
+
+    /// "Reply with Claude" from a notification: answer now, whether or not auto-reply is on for this chat.
+    func replyOnRequest(_ key: String, guid: String, handle: String?) async {
+        let config = await state.config
+        let turn = Turn(key: key, guid: guid, handle: handle, canAct: true, dryRun: config.dryRun, maxPerHour: config.maxRepliesPerHour,
+                        userAsked: true)
+        await state.log(.info, key, "You asked \(await state.providerName) to reply")
+        schedule(key, delay: 0) { await $0.reply(turn) }
     }
 
     /// The outbox calls this right before handing an AI text to Messages, so its chat.db row isn't mistaken for you.
@@ -375,11 +466,21 @@ actor Agent {
 
         let isGroup = history.contains(where: \.isGroup)
         let title = await state.title(for: key)
-        var system = systemPrompt(config: config, key: key, title: title, isGroup: isGroup, snapshot: snapshot)
+        var system = systemPrompt(config: config, key: key, title: title, isGroup: isGroup, snapshot: snapshot,
+                                  mine: await myTexts(key, written: config.aiWritten[key] ?? []))
+        if let task = turn.task { system += "\n\n" + task }
         // Claude Code runs with its tools off, so the reply comes from the transcript and injected context alone.
         if config.provider == .claudeCode {
-            let reply = try await claude.complete(system: system, prompt: transcript(history, title: title, isGroup: isGroup),
-                                                  model: config.claudeCodeModel, customPath: config.claudeCodePath)
+            // Claude can't page back through the chat itself, so it gets a longer stretch of it up front,
+            // plus your MCP integrations (and web search, if on) to look things up.
+            let longer = config.historyLimit < 60
+                ? (try await db.history(identifier: key, limit: 60)).filter { !$0.isRetracted && !config.hiddenMessages.contains($0.guid) }
+                : history
+            let servers = await ClaudeCode.servers(for: config)
+            let webSearch = config.integrations.contains { $0.enabled && $0.kind == .webSearch }
+            let reply = try await claude.complete(system: system, prompt: transcript(longer, title: title, isGroup: isGroup),
+                                                  model: config.claudeCodeModel, customPath: config.claudeCodePath,
+                                                  servers: servers, webSearch: webSearch)
             await state.recordClaudeUsage(reply)
             return Draft(text: Self.clean(reply.text), tools: [], ms: start.duration(to: clock.now).ms)
         }
@@ -390,7 +491,7 @@ actor Agent {
             ["role": "system", "content": .string(system)],
             ["role": "user", "content": .string(transcript(history, title: title, isGroup: isGroup))],
         ]
-        var tools = [Self.historyTool, Self.statusTool] + (turn.canAct ? Self.actionTools : []) + snapshot.tools
+        var tools = [Self.earlierTool, Self.historyTool, Self.statusTool] + (turn.canAct ? Self.actionTools : []) + snapshot.tools
         var used: [String] = []
         let maxSteps = 4
 
@@ -455,6 +556,13 @@ actor Agent {
             result = hits.isEmpty ? "No matches." : hits.map { "[\(Self.stamp($0.date))] \($0.isFromMe ? "Me" : "Them"): \($0.text)" }.joined(separator: "\n")
         case Self.statusTool.name:
             result = await messageStatus(turn, limit: args["limit"]?.int ?? 5)
+        case Self.earlierTool.name:
+            let config = await state.config
+            let count = min(max(args["count"]?.int ?? 60, 10), 200)
+            let all = (try? await db.history(identifier: turn.key, limit: config.historyLimit + count)) ?? []
+            let earlier = all.dropLast(config.historyLimit).filter { !$0.isRetracted && !config.hiddenMessages.contains($0.guid) }
+            result = earlier.isEmpty ? "There are no earlier messages." : "Earlier messages, oldest first:\n"
+                + earlier.map { "[\(Self.stamp($0.date))] \($0.isFromMe ? "Me" : "Them"): \($0.text)" }.joined(separator: "\n")
         case _ where Self.actionTools.contains(where: { $0.name == name }):
             result = turn.canAct ? await act(name, args, turn) : "Not available while drafting."
         default:
@@ -549,12 +657,22 @@ actor Agent {
         }
     }
 
-    private func systemPrompt(config: AppConfig, key: String, title: String, isGroup: Bool, snapshot: HubSnapshot) -> String {
+    private func systemPrompt(config: AppConfig, key: String, title: String, isGroup: Bool, snapshot: HubSnapshot,
+                              mine: [String] = []) -> String {
         var s = config.persona.trimmed
         s += "\n\nIt is now \(Date().formatted(date: .complete, time: .shortened)) (\(TimeZone.current.identifier))."
         s += isGroup
             ? "\nThis is the group chat \"\(title)\". Only reply when someone addresses me or a reply is clearly natural."
             : "\nI'm texting with \(title) (\(key))."
+        // How I actually talk to this person beats the general style, once there's enough to go on.
+        if mine.count >= 5 {
+            let who = isGroup ? "this group" : title
+            s += "\n\nHow I text \(who), from my own recent texts here (oldest first):\n"
+                + mine.map { "- \($0)" }.joined(separator: "\n")
+            s += "\nWrite the way I write to \(isGroup ? "this group" : "them"): my usual length, capitalization, punctuation, "
+                + "emoji, slang, and how warm, playful, blunt or formal I am with \(isGroup ? "them" : "this person"). That matters more "
+                + "than the general style above (but follow the instructions for this conversation if there are any)."
+        }
         if let notes = config.contacts[key]?.instructions.trimmed, !notes.isEmpty {
             s += "\n\nInstructions for this conversation:\n\(notes)"
         }
@@ -562,10 +680,52 @@ actor Agent {
         s += """
 
 
+        You are writing as me, in my voice, to someone I know. Never say you're an AI, an assistant or a language model, \
+        and never say you can't respond or don't have context (unless they sincerely ask whether they're talking to a bot). \
+        If the latest text doesn't make sense on its own, read the earlier messages first (and look things up with your tools \
+        if that helps) so you know what they mean. If it's still unclear after that, reply the way I would: briefly ask what \
+        they mean, casually.
+
         Output only the text message to send: no quotes, labels or explanations. \
         If no reply is needed (the conversation wrapped up, or it was just a reaction), output exactly NO_REPLY.
         """
         return s
+    }
+
+    /// The safety net: if a draft still reads like an assistant refusing ("As an AI…", "I don't have enough context…"),
+    /// try once more with a much longer stretch of the conversation; if it still can't, send nothing.
+    private func composeChecked(_ turn: Turn, config: AppConfig, apiKey: String) async throws -> Draft {
+        let first = try await compose(turn, config: config, apiKey: apiKey)
+        guard let text = first.text, Self.soundsLikeAssistant(text) else { return first }
+        // Asked point-blank whether it's a bot: an honest answer is allowed (per the persona), so leave it be.
+        let lastTheirs = (try? await db.history(identifier: turn.key, limit: 4))?.last(where: { !$0.isFromMe })?.text.lowercased() ?? ""
+        if Self.botQuestion.firstMatch(in: lastTheirs, range: NSRange(lastTheirs.startIndex..., in: lastTheirs)) != nil { return first }
+
+        var deeper = config
+        deeper.historyLimit = max(config.historyLimit * 4, 150)
+        deeper.persona += "\n\nYour last draft sounded like an assistant refusing or said you lacked context. Read the whole conversation, " +
+            "work out what they mean, and reply naturally as me. Never mention being an AI or an assistant."
+        var second = try await compose(turn, config: deeper, apiKey: apiKey)
+        second.tools = first.tools + second.tools
+        second.ms += first.ms
+        if let retry = second.text, Self.soundsLikeAssistant(retry) {
+            return Draft(text: nil, tools: second.tools, ms: second.ms, refused: true)
+        }
+        return second
+    }
+
+    private static let assistantTalk = try! NSRegularExpression(pattern:
+        #"\b(as an ai|i'?m an ai|i am an ai|ai (?:language )?(?:model|assistant)|language model|i'?m (?:just )?an? (?:ai|assistant|bot)|i'?m claude|"#
+        + #"i (?:can'?t|cannot|am unable to|'m unable to|am not able to|'m not able to) (?:assist|help with (?:that|this)|answer that|respond to (?:that|this)|reply to (?:that|this)|see (?:your|the) messages)|"#
+        + #"i don'?t have (?:enough |any |the )?(?:context|information|access|background)|without (?:more|additional|further) context|"#
+        + #"could you (?:please )?provide more context)\b"#, options: [.caseInsensitive])
+
+    private static let botQuestion = try! NSRegularExpression(pattern:
+        #"\b(bot|robot|chatgpt|claude|automated|auto.?reply|real person|is this (?:really )?you|are you (?:an? )?(?:ai|real|human))\b"#,
+        options: [.caseInsensitive])
+
+    static func soundsLikeAssistant(_ text: String) -> Bool {
+        assistantTalk.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil
     }
 
     private func transcript(_ history: [ChatMessage], title: String, isGroup: Bool) -> String {
@@ -604,6 +764,35 @@ actor Agent {
         guard let i = list.firstIndex(where: { $0.text == Self.normalize(text) }) else { return false }
         list.remove(at: i)
         return true
+    }
+
+    /// True when this text makes `floodTexts` from the chat inside `floodMinutes`.
+    private func flooded(_ key: String, _ limits: LimitSettings, _ now: Date) -> Bool {
+        let cutoff = now.addingTimeInterval(-limits.floodMinutes * 60)
+        let recent = (incoming[key] ?? []).filter { $0 > cutoff } + [now]
+        incoming[key] = recent
+        return limits.floodTexts > 0 && recent.count >= limits.floodTexts
+    }
+
+    func unblock(_ key: String) {
+        blockedUntil[key] = nil
+        incoming[key] = nil
+    }
+
+    private func underGlobalLimit(_ limit: Int) -> Bool {
+        guard limit > 0 else { return true }
+        let cutoff = Date().addingTimeInterval(-3600)
+        return replies.values.reduce(0) { $0 + $1.filter { $0 > cutoff }.count } < limit
+    }
+
+    /// My own latest texts in this conversation, without the ones the AI wrote, to learn how I talk to them.
+    private func myTexts(_ key: String, written: [String]) async -> [String] {
+        let skip = Set(written)
+        let recent = (try? await db.history(identifier: key, limit: 300)) ?? []
+        return recent
+            .filter { $0.isFromMe && !$0.isRetracted && !$0.text.trimmed.isEmpty && !skip.contains(AppState.fingerprint($0.text)) }
+            .suffix(25)
+            .map { String($0.text.trimmed.prefix(300)) }
     }
 
     private func underRateLimit(_ key: String, _ limit: Int) -> Bool {

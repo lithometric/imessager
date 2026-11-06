@@ -15,7 +15,17 @@ final class ContactsIndex: @unchecked Sendable {
         let name: String
         let handle: String
         let label: String
+        var company: String? = nil
+        var jobTitle: String? = nil
         var id: String { handle }
+    }
+
+    /// Everyone in Contacts, one per name, with where they work (for the command bar's "anyone at…" requests).
+    struct Person: Sendable {
+        let name: String
+        let company: String?
+        let jobTitle: String?
+        let handles: [String]
     }
     private var photos: [String: Photo?] = [:]       // contact identifier → photo data
 
@@ -61,22 +71,27 @@ final class ContactsIndex: @unchecked Sendable {
         var i: [String: String] = [:]
         var list: [Entry] = []
         let keys = [CNContactGivenNameKey, CNContactFamilyNameKey, CNContactNicknameKey, CNContactOrganizationNameKey,
-                    CNContactPhoneNumbersKey, CNContactEmailAddressesKey, CNContactImageDataAvailableKey] as [CNKeyDescriptor]
+                    CNContactJobTitleKey, CNContactPhoneNumbersKey, CNContactEmailAddressesKey,
+                    CNContactImageDataAvailableKey] as [CNKeyDescriptor]
         try? store.enumerateContacts(with: CNContactFetchRequest(keysToFetch: keys)) { contact, _ in
             let name = Self.displayName(contact)
             guard !name.isEmpty else { return }
+            let company = contact.organizationName.trimmed.isEmpty ? nil : contact.organizationName.trimmed
+            let jobTitle = contact.jobTitle.trimmed.isEmpty ? nil : contact.jobTitle.trimmed
             for number in contact.phoneNumbers {
                 let key = Self.phoneKey(number.value.stringValue)
                 guard !key.isEmpty else { continue }
                 p[key] = name
                 if contact.imageDataAvailable { i[key] = contact.identifier }
-                list.append(Entry(name: name, handle: number.value.stringValue, label: Self.label(number.label, fallback: "phone")))
+                list.append(Entry(name: name, handle: number.value.stringValue, label: Self.label(number.label, fallback: "phone"),
+                                  company: company, jobTitle: jobTitle))
             }
             for email in contact.emailAddresses {
                 let key = (email.value as String).lowercased()
                 e[key] = name
                 if contact.imageDataAvailable { i[key] = contact.identifier }
-                list.append(Entry(name: name, handle: email.value as String, label: Self.label(email.label, fallback: "email")))
+                list.append(Entry(name: name, handle: email.value as String, label: Self.label(email.label, fallback: "email"),
+                                  company: company, jobTitle: jobTitle))
             }
         }
         lock.withLock {
@@ -116,6 +131,36 @@ final class ContactsIndex: @unchecked Sendable {
         }
         return Array(hits.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }.prefix(limit))
     }
+
+    /// People whose name, company, job title, number or email contains `query` (everyone when it's empty).
+    func people(matching query: String = "", withCompanyOnly: Bool = false) -> [Person] {
+        let q = query.trimmed.lowercased()
+        var order: [String] = []
+        var byName: [String: (company: String?, title: String?, handles: [String])] = [:]
+        for entry in lock.withLock({ entries }) {
+            if byName[entry.name] == nil { order.append(entry.name) }
+            var person = byName[entry.name] ?? (entry.company, entry.jobTitle, [])
+            person.handles.append(entry.handle)
+            byName[entry.name] = person
+        }
+        return order.compactMap { name in
+            guard let p = byName[name] else { return nil }
+            let domains = p.handles.compactMap { $0.split(separator: "@").last.map(String.init) }.filter { $0.contains(".") }
+            if withCompanyOnly, p.company == nil, domains.allSatisfy(Self.personalDomains.contains) { return nil }
+            if !q.isEmpty {
+                let haystack = ([name, p.company ?? "", p.title ?? ""] + p.handles).joined(separator: " ").lowercased()
+                let digits = q.filter(\.isNumber)
+                guard haystack.contains(q) || (digits.count >= 4 && haystack.filter(\.isNumber).contains(digits)) else { return nil }
+            }
+            return Person(name: name, company: p.company, jobTitle: p.title, handles: p.handles)
+        }
+    }
+
+    /// Email providers that say nothing about where someone works.
+    private static let personalDomains: Set<String> = [
+        "gmail.com", "icloud.com", "me.com", "mac.com", "yahoo.com", "hotmail.com", "outlook.com", "live.com", "aol.com",
+        "protonmail.com", "proton.me", "msn.com", "comcast.net", "att.net", "verizon.net",
+    ]
 
     /// Messages' form of a handle: "+15551234567" for numbers, lowercase for emails.
     static func normalized(_ handle: String) -> String {

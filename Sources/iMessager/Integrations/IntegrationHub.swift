@@ -155,6 +155,8 @@ actor IntegrationHub {
         case .webSearch: WebSearchIntegration(config, llm: llm, credentials: credentials)
         case .mcp:
             MCPIntegration(config) { [report, id = config.id] status in report(id, status) }
+        case .remoteMCP:
+            RemoteMCPIntegration(config) { [report, id = config.id] status in report(id, status) }
         }
     }
 }

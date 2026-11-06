@@ -9,8 +9,15 @@ struct IntegrationsView: View {
         Page {
             PageIntro("Context the AI can use when it replies. Small local sources go straight into the prompt (no extra round trip); bigger ones become tools it calls only when needed.") {
                 Menu {
-                    ForEach(IntegrationKind.allCases) { kind in
-                        Button { state.addIntegration(kind) } label: { Label(kind.title, systemImage: kind.icon) }
+                    Section("Quick add") {
+                        ForEach(IntegrationPreset.allCases) { preset in
+                            Button { state.addPreset(preset) } label: { Label(preset.title, systemImage: preset.icon) }
+                        }
+                    }
+                    Section("Any source") {
+                        ForEach(IntegrationKind.allCases) { kind in
+                            Button { state.addIntegration(kind) } label: { Label(kind.title, systemImage: kind.icon) }
+                        }
                     }
                 } label: {
                     Label("Add Integration", systemImage: "plus")
@@ -82,15 +89,14 @@ private struct IntegrationCard: View {
                     .padding(.horizontal, 8).padding(.vertical, 3)
                     .background(Color.primary.opacity(0.06), in: Capsule())
                     .frame(maxWidth: 220, alignment: .trailing)
-                    .help(status)
             }
             Toggle("Enabled", isOn: $item.enabled)
                 .toggleStyle(.switch)
                 .labelsHidden()
             Menu {
                 Button("Test") { Task { await test() } }
-                if item.kind == .mcp {
-                    Button("Restart server") { Task { await state.restartIntegration(item.id) } }
+                if item.kind == .mcp || item.kind == .remoteMCP {
+                    Button(item.kind == .mcp ? "Restart server" : "Reconnect") { Task { await state.restartIntegration(item.id) } }
                 }
                 Divider()
                 Button("Remove", role: .destructive) {
@@ -144,6 +150,9 @@ private struct IntegrationCard: View {
             Editor(title: "About you", text: $item.notes,
                    placeholder: "Your name, what you do, where you live, how you text, who's who, standing plans the AI should know…")
         case .calendar:
+            Text("Reads every calendar in the macOS Calendar app, Google Calendar included once your Google account is added in System Settings › Internet Accounts.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             Stepper("Include the next \(item.days) day\(item.days == 1 ? "" : "s") of events in every prompt", value: $item.days, in: 0...14)
                 .font(.callout)
             HStack(spacing: 8) {
@@ -196,6 +205,46 @@ private struct IntegrationCard: View {
                     .font(.system(.callout, design: .monospaced))
             }
             Editor(title: "Environment, one KEY=value per line", text: $item.env, placeholder: "GITHUB_PERSONAL_ACCESS_TOKEN=…", mono: true)
+        case .remoteMCP:
+            let isGitHub = (URL(string: item.url)?.host() ?? "").contains("github")
+            if isGitHub {
+                Text("GitHub doesn't offer browser sign-in to other apps. Use your GitHub CLI login, or paste a personal access token as “Authorization: Bearer …”. Read-only by default (X-MCP-Readonly), since replies are triggered by other people's texts.")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else if !item.notes.isEmpty {
+                Text(item.notes).font(.caption).foregroundStyle(.secondary)
+            }
+            Field("Server URL") {
+                TextField("URL", text: $item.url, prompt: Text("https://mcp.example.com/mcp"))
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(.callout, design: .monospaced))
+            }
+            HStack(spacing: 10) {
+                if let tokens = MCPAuth.tokens(for: item.id) {
+                    Label(tokens.clientID == MCPAuth.githubCLIClient ? "Using your GitHub CLI login" : "Signed in with your browser",
+                          systemImage: "checkmark.seal.fill")
+                        .font(.callout)
+                        .foregroundStyle(.green)
+                    Button("Sign Out") { state.signOutMCP(item.id) }
+                        .glassButtonStyle()
+                } else if (URL(string: item.url)?.host() ?? "").contains("github") {
+                    if MCPAuth.githubCLI != nil {
+                        Button { state.useGitHubCLI(item.id) } label: { Label("Use GitHub CLI Login", systemImage: "terminal") }
+                            .glassButtonStyle(prominent: true)
+                    }
+                    Button("Create a Token…") {
+                        NSWorkspace.shared.open(URL(string: "https://github.com/settings/personal-access-tokens/new")!)
+                    }
+                    .glassButtonStyle()
+                } else {
+                    Button { state.signInMCP(item.id) } label: { Label("Sign In with Browser", systemImage: "person.badge.key") }
+                        .glassButtonStyle(prominent: true)
+                    Text("For servers that use OAuth (Linear, Notion, Atlassian…)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Editor(title: "Headers, one per line (or a token instead of signing in)", text: $item.headers,
+                   placeholder: "Authorization: Bearer …", mono: true)
         case .webSearch:
             Field("Model override") {
                 TextField("Model", text: $item.model, prompt: Text("Optional. Defaults to your reply model"))
@@ -215,6 +264,7 @@ private struct IntegrationCard: View {
         case .folder: .blue
         case .webhook: .teal
         case .mcp: .purple
+        case .remoteMCP: .indigo
         case .webSearch: .green
         }
     }

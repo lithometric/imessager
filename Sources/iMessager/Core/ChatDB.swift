@@ -150,6 +150,7 @@ struct RawChat: Sendable {
     let participants: [String]
     var lastSender: String?         // who sent the newest message, for "Maya: …" previews in groups
     var groupID: String?            // stable id Messages uses for groups across devices (and for pins)
+    var hasMine = false             // you've texted in this conversation before
     var samples: [String] = []      // latest incoming texts, for spotting automated senders
     var photoPath: String?          // group photo, from the chat's properties
 }
@@ -336,6 +337,56 @@ actor ChatDB {
             .sorted { $0.date < $1.date }
     }
 
+    /// Texts in any conversation that contain every word of `query` (or, failing that, any of them), newest first.
+    /// Reads the attributed body too: newer Messages often leaves the plain text column empty.
+    func searchAll(query: String, limit: Int) throws -> [ChatMessage] {
+        let terms = Array(query.lowercased()
+            .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+            .map(String.init).filter { $0.count > 1 }.prefix(5))
+        guard !terms.isEmpty else { return [] }
+        for joiner in terms.count > 1 ? [" AND ", " OR "] : [" AND "] {
+            let clause = terms.map { _ in "(m.text LIKE ? OR m.attributedBody LIKE ?)" }.joined(separator: joiner)
+            var args: [Any?] = terms.flatMap { ["%\($0)%", "%\($0)%"] as [Any?] }
+            args.append(limit)
+            var out: [ChatMessage] = []
+            try run {
+                try $0.query("""
+                    SELECT \(columns) FROM chat c
+                    JOIN chat_message_join cmj ON cmj.chat_id = c.ROWID
+                    JOIN message m ON m.ROWID = cmj.message_id
+                    LEFT JOIN handle h ON h.ROWID = m.handle_id
+                    WHERE m.associated_message_type = 0 AND m.item_type = 0 AND (\(clause))
+                    ORDER BY cmj.message_date DESC LIMIT ?
+                    """, args) { row in
+                    let m = Self.message(row)
+                    if !m.text.isEmpty, !m.isRetracted { out.append(m) }
+                }
+            }
+            if !out.isEmpty { return out }
+        }
+        return []
+    }
+
+    /// Every text in a stretch of time, across conversations, oldest first.
+    func messages(from start: Date, to end: Date, limit: Int) throws -> [ChatMessage] {
+        let stamp = { (d: Date) in Int64(d.timeIntervalSinceReferenceDate * 1_000_000_000) }
+        var out: [ChatMessage] = []
+        try run {
+            try $0.query("""
+                SELECT \(columns) FROM chat c
+                JOIN chat_message_join cmj ON cmj.chat_id = c.ROWID
+                JOIN message m ON m.ROWID = cmj.message_id
+                LEFT JOIN handle h ON h.ROWID = m.handle_id
+                WHERE cmj.message_date BETWEEN ? AND ? AND m.associated_message_type = 0 AND m.item_type = 0
+                ORDER BY cmj.message_date DESC LIMIT ?
+                """, [stamp(start), stamp(end), limit]) { row in
+                let m = Self.message(row)
+                if !m.text.isEmpty, !m.isRetracted { out.append(m) }
+            }
+        }
+        return out.reversed()
+    }
+
     func sentCount(identifier: String) throws -> Int {
         var n = 0
         try run {
@@ -365,7 +416,7 @@ actor ChatDB {
         }
         struct Row { let rowID: Int64; let guid: String; let identifier: String; let displayName: String?; let style: Int
             let service: String; let preview: String; let fromMe: Bool; let failed: Bool; let date: Date; let properties: Data?
-            let sender: String?; let groupID: String? }
+            let sender: String?; let groupID: String?; let mine: Bool }
         var rows: [Row] = []
         var seen = Set<String>()
         var chats: [RawChat] = []
@@ -374,7 +425,9 @@ actor ChatDB {
                 SELECT c.ROWID, c.guid, c.chat_identifier, c.display_name, c.style, c.service_name,
                        m.text, m.attributedBody, m.is_from_me, m.date, m.cache_has_attachments, \(columns.contains("m.error") ? "m.error" : "0"),
                        \(chatColumns.contains("properties") ? "c.properties" : "NULL"), h.id,
-                       \(chatColumns.contains("group_id") ? "c.group_id" : "NULL")
+                       \(chatColumns.contains("group_id") ? "c.group_id" : "NULL"),
+                       EXISTS(SELECT 1 FROM chat_message_join j3 JOIN message m3 ON m3.ROWID = j3.message_id
+                              WHERE j3.chat_id = c.ROWID AND m3.is_from_me = 1)
                 FROM (SELECT chat_id, MAX(message_id) AS mid FROM chat_message_join GROUP BY chat_id) j
                 JOIN chat c ON c.ROWID = j.chat_id
                 JOIN message m ON m.ROWID = j.mid
@@ -387,7 +440,7 @@ actor ChatDB {
                                 style: Int(r.int(4)), service: r.string(5) ?? "iMessage",
                                 preview: Self.previewText(r.string(6), r.data(7), hasAttachments: r.int(10) != 0),
                                 fromMe: r.int(8) != 0, failed: r.int(8) != 0 && r.int(11) != 0, date: Self.appleDate(r.int(9)),
-                                properties: r.data(12), sender: r.string(13), groupID: r.string(14)))
+                                properties: r.data(12), sender: r.string(13), groupID: r.string(14), mine: r.int(15) != 0))
             }
             for row in rows.prefix(limit) {
                 var participants: [String] = []
@@ -408,6 +461,7 @@ actor ChatDB {
                 chat.samples = samples
                 chat.lastSender = row.sender
                 chat.groupID = row.groupID
+                chat.hasMine = row.mine
                 chat.photoPath = photo
                 chats.append(chat)
             }

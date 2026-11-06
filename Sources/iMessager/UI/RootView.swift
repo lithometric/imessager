@@ -2,8 +2,9 @@ import AppKit
 import SwiftUI
 
 /// Pages open from the menu bar as a modal over the blurred app, like Arc.
+/// The pages in the Settings sheet, one tab each.
 enum AppModal: String, CaseIterable, Identifiable {
-    case activity, integrations, settings, setup
+    case settings, integrations, activity, unsubscribe, setup
 
     var id: String { rawValue }
 
@@ -11,6 +12,7 @@ enum AppModal: String, CaseIterable, Identifiable {
         switch self {
         case .activity: "Activity"
         case .integrations: "Integrations"
+        case .unsubscribe: "Unsubscribe"
         case .settings: "Settings"
         case .setup: "Setup Checklist"
         }
@@ -20,6 +22,7 @@ enum AppModal: String, CaseIterable, Identifiable {
         switch self {
         case .activity: "waveform.path.ecg"
         case .integrations: "puzzlepiece.extension"
+        case .unsubscribe: "bell.slash"
         case .settings: "gearshape"
         case .setup: "checklist"
         }
@@ -53,8 +56,9 @@ struct RootView: View {
                             } label: {
                                 Label("New Message", systemImage: "square.and.pencil")
                             }
-                            .help("New Message (⌘N)")
+                            .hiddenUnderModal()
                         }
+                        .glassBackdropHidden(state.modal != nil)
                     }
             }
             .background(SidebarLock())
@@ -123,41 +127,59 @@ private struct ModalLayer: View {
 private struct ModalCard: View {
     @Environment(AppState.self) private var state
     let modal: AppModal
+    @Namespace private var tabs
 
     var body: some View {
         GeometryReader { geo in
             let shape = RoundedRectangle(cornerRadius: 26, style: .continuous)
             VStack(spacing: 0) {
-                if modal != .setup {
-                    HStack(spacing: 10) {
-                        Image(systemName: modal.icon)
-                            .font(.system(size: 14, weight: .semibold))
-                            .foregroundStyle(Color.accentColor)
-                        Text(modal.title).font(.title3.weight(.semibold))
-                        Spacer()
-                        Button { state.modal = nil } label: {
-                            Image(systemName: "xmark").font(.system(size: 11, weight: .bold)).frame(width: 16, height: 16)
+                // Settings, Integrations, Activity and Setup as tabs of one page.
+                HStack(spacing: 4) {
+                    ForEach(AppModal.allCases) { tab in
+                        Button { state.modal = tab } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: tab.icon)
+                                Text(tab == .setup ? "Setup" : tab.title)
+                                if tab == .setup, state.needsSetup {
+                                    Circle().fill(Color.orange).frame(width: 6, height: 6)
+                                }
+                            }
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .foregroundStyle(tab == modal ? Color.primary : Color.secondary)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background {
+                                if tab == modal {
+                                    Capsule().fill(Color.primary.opacity(0.1)).matchedGeometryEffect(id: "tab", in: tabs)
+                                }
+                            }
+                            .contentShape(Capsule())
                         }
-                        .glassButtonStyle()
-                        .buttonBorderShape(.circle)
-                        .keyboardShortcut(.cancelAction)
-                        .help("Close (Esc)")
+                        .buttonStyle(.plain)
                     }
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 14)
-                    Divider().opacity(0.6)
+                    Spacer()
+                    Button { state.modal = nil } label: {
+                        Image(systemName: "xmark").font(.system(size: 11, weight: .bold)).frame(width: 16, height: 16)
+                    }
+                    .glassButtonStyle()
+                    .buttonBorderShape(.circle)
+                    .keyboardShortcut(.cancelAction)
                 }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 12)
+                Divider().opacity(0.6)
                 Group {
                     switch modal {
                     case .activity: ActivityView()
                     case .integrations: IntegrationsView()
+                    case .unsubscribe: UnsubscribeView()
                     case .settings: SettingsView()
                     case .setup: SetupChecklist()
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            .frame(width: min(780, geo.size.width - 80), height: min(modal == .setup ? 660 : 680, geo.size.height - 60))
+            .frame(width: min(780, geo.size.width - 80), height: min(680, geo.size.height - 60))
             .background(Color(nsColor: .windowBackgroundColor).opacity(0.82), in: shape)
             .liquidGlass(in: shape)
             .clipShape(shape)

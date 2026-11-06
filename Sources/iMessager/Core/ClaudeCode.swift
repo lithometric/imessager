@@ -68,7 +68,9 @@ actor ClaudeCode {
 
     // MARK: - Completion
 
-    func complete(system: String, prompt: String, model: String, customPath: String) async throws -> Reply {
+    /// `servers`: your enabled MCP integrations, the only tools Claude gets (plus web search if `webSearch`).
+    func complete(system: String, prompt: String, model: String, customPath: String,
+                  servers: [IntegrationConfig] = [], webSearch: Bool = false, timeout: Double = 120) async throws -> Reply {
         guard let path = locate(customPath) else { throw AppError("Claude Code isn't installed.") }
         try FileManager.default.createDirectory(at: Self.workDir, withIntermediateDirectories: true)
         let systemFile = Self.workDir.appendingPathComponent("system-\(UUID().uuidString).txt")
@@ -76,18 +78,31 @@ actor ClaudeCode {
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: systemFile.path)
         defer { try? FileManager.default.removeItem(at: systemFile) }
 
-        let args = [
+        var args = [
             "-p", "--output-format", "json",
             "--model", model,
             "--system-prompt-file", systemFile.path,
-            "--tools", "",                 // no built-in tools (no Bash, Read, Edit, WebFetch…)
-            "--strict-mcp-config",         // no MCP servers
+            "--tools", webSearch ? "WebSearch" : "",   // built-ins off (no Bash, Read, Edit, WebFetch…), except search if enabled
+            "--strict-mcp-config",         // only the integrations below, none of Claude Code's own MCP servers
             "--setting-sources", "",       // no user/project settings, hooks or CLAUDE.md
             "--no-session-persistence",
         ]
+        // Your MCP integrations, so Claude can look things up (GitHub, CRM, …) the way OpenRouter models do.
+        let mcp = Self.mcpConfig(servers)
+        var mcpFile: URL?
+        if !mcp.names.isEmpty {
+            let file = Self.workDir.appendingPathComponent("mcp-\(UUID().uuidString).json")
+            try mcp.json.data().write(to: file, options: [.atomic, .completeFileProtection])
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+            mcpFile = file
+            args += ["--mcp-config", file.path]
+        }
+        let allowed = mcp.names.map { "mcp__\($0)" } + (webSearch ? ["WebSearch"] : [])
+        if !allowed.isEmpty { args += ["--allowedTools"] + allowed }
+        defer { if let mcpFile { try? FileManager.default.removeItem(at: mcpFile) } }
         let clock = ContinuousClock()
         let start = clock.now
-        let out = try await run(path, args, stdin: Data(prompt.utf8), timeout: 120)
+        let out = try await run(path, args, stdin: Data(prompt.utf8), timeout: timeout)
         guard let json = try? JSON.parse(out.stdout) else {
             let err = String(decoding: out.stderr, as: UTF8.self).trimmed
             throw AppError(err.isEmpty ? "Claude Code didn't return a reply." : "Claude Code: \(err.prefix(300))")
@@ -99,6 +114,40 @@ actor ClaudeCode {
                      ms: start.duration(to: clock.now).ms,
                      inputTokens: (json["usage"]?["input_tokens"]?.int ?? 0) + (json["usage"]?["cache_read_input_tokens"]?.int ?? 0),
                      outputTokens: json["usage"]?["output_tokens"]?.int ?? 0)
+    }
+
+    /// Your enabled MCP integrations, with the token of any you signed in to through the browser added as a header.
+    static func servers(for config: AppConfig) async -> [IntegrationConfig] {
+        var servers = config.integrations.filter { $0.enabled && ($0.kind == .mcp || $0.kind == .remoteMCP) }
+        for i in servers.indices where servers[i].kind == .remoteMCP {
+            let hasToken = KeyValue.parse(servers[i].headers, separator: ":").contains {
+                $0.0.lowercased() == "authorization" && $0.1.trimmed.count > "bearer".count
+            }
+            if !hasToken, let token = await MCPAuth.accessToken(for: servers[i].id) {
+                servers[i].headers = "Authorization: Bearer \(token)"
+            }
+        }
+        return servers
+    }
+
+    /// Claude Code's --mcp-config for the given integrations: local servers by command, hosted ones by URL and headers.
+    private static func mcpConfig(_ servers: [IntegrationConfig]) -> (json: JSON, names: [String]) {
+        var entries: [String: JSON] = [:]
+        for server in servers where server.enabled {
+            let name = Slug.make(server.name, max: 24)
+            guard !name.isEmpty, entries[name] == nil else { continue }
+            switch server.kind {
+            case .mcp where !server.command.trimmed.isEmpty:
+                let env = KeyValue.parse(server.env, separator: "=").reduce(into: [String: JSON]()) { $0[$1.0] = .string($1.1) }
+                entries[name] = ["type": "stdio", "command": "/bin/zsh", "args": ["-lc", .string("exec \(server.command)")], "env": .object(env)]
+            case .remoteMCP where !server.url.trimmed.isEmpty:
+                let headers = KeyValue.parse(server.headers, separator: ":").reduce(into: [String: JSON]()) { $0[$1.0] = .string($1.1) }
+                entries[name] = ["type": "http", "url": .string(server.url.trimmed), "headers": .object(headers)]
+            default:
+                continue
+            }
+        }
+        return (["mcpServers": .object(entries)], entries.keys.sorted())
     }
 
     // MARK: - Process

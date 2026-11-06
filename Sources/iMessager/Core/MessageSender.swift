@@ -1,3 +1,4 @@
+import AppKit
 import CoreServices
 import Foundation
 
@@ -62,6 +63,21 @@ final class MessageSender {
             guard !handle.contains("@") else { throw AppError("Email addresses can't get text messages.") }
         }
         try call("sendmessage", chatGUID, handle ?? "", text, asTextMessage ? "1" : "0", asTextMessage: asTextMessage)
+    }
+
+    /// Messages has to be running to send. If it isn't, start it hidden and in the background, so a text going out
+    /// never puts its window in front of you. (Already running with its window closed is fine as is.)
+    func launchMessagesIfNeeded() async {
+        let id = "com.apple.MobileSMS"
+        guard NSRunningApplication.runningApplications(withBundleIdentifier: id).isEmpty,
+              let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) else { return }
+        let options = NSWorkspace.OpenConfiguration()
+        options.activates = false
+        options.hides = true
+        options.addsToRecentItems = false
+        guard let app = try? await NSWorkspace.shared.openApplication(at: url, configuration: options) else { return }
+        for _ in 0..<50 where !app.isFinishedLaunching { try? await Task.sleep(for: .milliseconds(100)) }
+        try? await Task.sleep(for: .seconds(1))   // a moment for its accounts to sign in
     }
 
     private func call(_ handler: String, _ args: String..., asTextMessage: Bool = false) throws {

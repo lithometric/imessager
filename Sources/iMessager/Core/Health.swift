@@ -53,6 +53,10 @@ extension AppState {
                 out.append(AppNotice(id: "automation-ask", kind: .info, title: "Allow sending through Messages",
                                      message: "macOS will ask once before the first reply goes out. Do it now so no reply gets stuck waiting."))
             }
+            if config.notifications.incoming, !config.seenTips.contains("messages-notifications") {
+                out.append(AppNotice(id: "messages-notifications", kind: .info, title: "Turn off Messages' notifications",
+                                     message: "iMessager notifies you about new texts now. Switch Messages' notifications off so each text only shows once."))
+            }
             if contactsStatus == .denied {
                 out.append(AppNotice(id: "contacts-denied", kind: .warning, title: "Contacts access is off",
                                      message: "Chats show numbers instead of names, and the new-contact greeter can't tell who's new."))
@@ -64,6 +68,7 @@ extension AppState {
     func dismissNotice(_ id: String) {
         transientNotices.removeAll { $0.id == id }
         dismissedNotices.insert(id)
+        if id == "messages-notifications" { config.seenTips.insert(id) }
     }
 
     /// Checks everything chat.db reading and sending depend on. Cheap: one open() and one TCC query.

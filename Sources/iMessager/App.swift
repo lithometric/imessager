@@ -11,6 +11,7 @@ struct IMessagerApp: App {
             RootView()
                 .environment(state)
                 .frame(minWidth: Theme.minWindow.width, minHeight: Theme.minWindow.height)
+                .glassWindowBackground()
         }
         .defaultSize(width: 1240, height: 800)
         .windowResizability(.contentMinSize)
@@ -66,6 +67,11 @@ struct AppCommands: Commands {
         CommandMenu("Agent") {
             Text(state.statusLine)
             Divider()
+            Toggle("Auto-reply for Everyone", isOn: Binding(get: { state.config.autoReplyEveryone },
+                                                            set: { state.config.autoReplyEveryone = $0 }))
+            Toggle("Auto-reply in Group Chats", isOn: Binding(get: { state.config.autoReplyGroups },
+                                                              set: { state.config.autoReplyGroups = $0 }))
+            Divider()
             Button("Activity") { show(.activity) }
                 .keyboardShortcut("1", modifiers: [.command, .shift])
             Button("Integrations") { show(.integrations) }
@@ -97,8 +103,9 @@ struct MenuBarMenu: View {
             }
         }
         Divider()
-        Button("Activity") { show(.activity) }
         Button("Settings…") { show(.settings) }
+        Button("Integrations") { show(.integrations) }
+        Button("Activity") { show(.activity) }
         Divider()
         Button("Open iMessager") {
             openWindow(id: "main")

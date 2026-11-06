@@ -44,7 +44,6 @@ private struct NoticeCard: View {
                     Image(systemName: "xmark").font(.caption.weight(.bold))
                 }
                 .buttonStyle(.borderless).foregroundStyle(.secondary)
-                .help("Dismiss")
             }
         }
         .padding(14)
@@ -77,6 +76,9 @@ private struct NoticeCard: View {
                 .glassButtonStyle(prominent: true)
         case "automation-ask":
             Button("Allow") { Task { await state.requestAutomation() } }
+                .glassButtonStyle(prominent: true)
+        case "messages-notifications":
+            Button("Open Messages Notifications") { state.openMessagesNotificationSettings() }
                 .glassButtonStyle(prominent: true)
         case "contacts-denied":
             Button("Open Contacts settings") { state.openPrivacyPane("Privacy_Contacts") }
@@ -143,6 +145,8 @@ struct SetupChecklist: View {
                     sendRow
                     keyRow
                     contactsRow
+                    readSyncRow
+                    messagesNotificationsRow
                 }
                 .padding(20)
             }
@@ -260,6 +264,28 @@ struct SetupChecklist: View {
                 }
                 .buttonStyle(.borderedProminent)
             }
+        }
+    }
+
+    private var readSyncRow: some View {
+        CheckRow(title: "Read status in Messages", required: false, status: MessagesSync.allowed ? .ok : .warning) {
+            Text(MessagesSync.allowed
+                 ? "Reading a conversation here marks it read in Messages and on your devices too."
+                 : "Allow Accessibility so reading a conversation here also marks it read in Messages (and on your iPhone).")
+            if !MessagesSync.allowed {
+                HStack {
+                    Button("Allow…") { MessagesSync.requestPermission() }.buttonStyle(.borderedProminent)
+                    Button("Open Settings") { state.openPrivacyPane("Privacy_Accessibility") }
+                }
+            }
+        }
+    }
+
+    private var messagesNotificationsRow: some View {
+        CheckRow(title: "Messages' own notifications", required: false,
+                 status: state.config.seenTips.contains("messages-notifications") ? .ok : .warning) {
+            Text("iMessager notifies you about new texts. Turn Messages' notifications off so each text only shows once. macOS doesn't let apps change this for another app, so it's one switch in System Settings.")
+            Button("Open Messages Notifications") { state.openMessagesNotificationSettings() }
         }
     }
 

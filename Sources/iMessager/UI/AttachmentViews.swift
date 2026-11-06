@@ -46,7 +46,6 @@ struct AttachmentView: View {
             if isImage || isVideo, let onOpen { onOpen(url) } else { NSWorkspace.shared.open(url) }
         }
         .onDrag { NSItemProvider(contentsOf: url) ?? NSItemProvider() }
-        .help(name)
     }
 
     private var media: some View {
@@ -147,18 +146,15 @@ struct MediaViewer: View {
                 HStack(spacing: 8) {
                     ShareLink(item: url) { Image(systemName: "square.and.arrow.up").frame(width: 18, height: 18) }
                         .glassCircleButton()
-                        .help("Share")
                     Button { NSWorkspace.shared.activateFileViewerSelecting([url]) } label: {
                         Image(systemName: "folder").frame(width: 18, height: 18)
                     }
                     .glassCircleButton()
-                    .help("Show in Finder")
                     Button(action: close) {
                         Image(systemName: "xmark").font(.system(size: 13, weight: .bold)).frame(width: 18, height: 18)
                     }
                     .glassCircleButton()
                     .keyboardShortcut(.cancelAction)
-                    .help("Close (Esc)")
                 }
             }
             .padding(16)
@@ -220,9 +216,7 @@ struct AttachmentChip: View {
             }
             .buttonStyle(.plain)
             .offset(x: 5, y: -5)
-            .help("Remove")
         }
-        .help(url.lastPathComponent)
         .task(id: url) { thumb = await Thumbnails.load(url, video: isVideo) }
     }
 }

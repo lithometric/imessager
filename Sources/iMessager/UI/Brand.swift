@@ -21,6 +21,18 @@ enum Brand {
     static func providerColor(_ provider: AIProvider) -> Color {
         provider == .claudeCode ? Color(red: 0xD9 / 255, green: 0x77 / 255, blue: 0x57 / 255) : .primary
     }
+    /// The logo of the model writing replies (Claude, ChatGPT or OpenRouter for anything else), and the color of the
+    /// little badge it sits on.
+    static func replyMark(_ config: AppConfig) -> (image: NSImage?, color: Color) {
+        if config.provider == .claudeCode || config.model.hasPrefix("anthropic/") {
+            return (image("Logo-claude"), providerColor(.claudeCode))
+        }
+        if config.model.hasPrefix("openai/") {
+            return (image("Logo-openai"), Color(white: 0.08))
+        }
+        return (image("Logo-openrouter"), Color(red: 0.39, green: 0.4, blue: 0.95))
+    }
+
     static let bubble = image("Bubble")
     static let wordmark = image("Wordmark")
 

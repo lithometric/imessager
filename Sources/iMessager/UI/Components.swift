@@ -76,11 +76,14 @@ struct Card<Content: View>: View {
 struct SearchField: View {
     @Binding var text: String
     var prompt = "Search"
+    /// While something runs on what was typed, a line of this color travels around the edge.
+    var working: Color? = nil
+    var onSubmit: () -> Void = {}
 
     var body: some View {
         HStack(spacing: 6) {
             Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-            TextField(prompt, text: $text).textFieldStyle(.plain)
+            TextField(prompt, text: $text).textFieldStyle(.plain).onSubmit(onSubmit)
             if !text.isEmpty {
                 Button { text = "" } label: {
                     Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
@@ -92,6 +95,8 @@ struct SearchField: View {
         .padding(.horizontal, 11)
         .padding(.vertical, 7)
         .liquidGlass(in: Capsule(), interactive: true)
+        .overlay { if let working { WorkingBorder(tint: working).transition(.opacity) } }
+        .animation(.easeOut(duration: 0.25), value: working != nil)
     }
 }
 
@@ -157,6 +162,68 @@ extension View {
             safeAreaBar(edge: edge, spacing: 0, content: bar)
         } else {
             safeAreaInset(edge: edge, spacing: 0, content: bar)
+        }
+    }
+}
+
+/// Toolbar items fade away while a page (Settings, Activity…) is open over the app: they live in the window's
+/// title bar, which the page's blurred backdrop can't cover.
+struct HiddenUnderModal: ViewModifier {
+    @Environment(AppState.self) private var state
+
+    func body(content: Content) -> some View {
+        content
+            .opacity(state.modal == nil ? 1 : 0)
+            .allowsHitTesting(state.modal == nil)
+            .animation(.easeOut(duration: 0.18), value: state.modal)
+    }
+}
+
+extension View {
+    func hiddenUnderModal() -> some View { modifier(HiddenUnderModal()) }
+
+    /// The window, like Messages: smoky dark glass, the desktop still faintly there behind it. The sidebar's glass
+    /// picks it up too.
+    @ViewBuilder
+    func glassWindowBackground() -> some View {
+        if #available(macOS 15, *) {
+            containerBackground(for: .window) { WindowBackdrop() }
+        } else {
+            self
+        }
+    }
+}
+
+/// Frosted glass with a tint: smoky black in dark mode, white in light mode. Settings › Appearance › Transparency
+/// sets how much of the desktop shows through.
+private struct WindowBackdrop: View {
+    @Environment(\.colorScheme) private var scheme
+
+    var body: some View {
+        // Read directly: the window's background sits outside the views the app state is handed to.
+        let clear = min(max(AppState.shared.config.transparency, 0), 1)
+        if scheme == .dark {
+            Rectangle()
+                .fill(.ultraThinMaterial)
+                .overlay(Color.black.opacity(0.75 - 0.5 * clear))
+        } else {
+            // Light glass brightens what's behind it and keeps its colors; a dark wallpaper still greys it,
+            // so a white wash on top keeps the page reading white.
+            Rectangle()
+                .fill(.regularMaterial)
+                .overlay(Color.white.opacity(0.8 - 0.55 * clear))
+        }
+    }
+}
+
+extension ToolbarContent {
+    /// Also hides the glass backdrop macOS 26 draws around each toolbar item (fading the button alone leaves it).
+    @ToolbarContentBuilder
+    func glassBackdropHidden(_ hidden: Bool) -> some ToolbarContent {
+        if #available(macOS 26, *) {
+            sharedBackgroundVisibility(hidden ? .hidden : .automatic)
+        } else {
+            self
         }
     }
 }

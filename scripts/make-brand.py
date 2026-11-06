@@ -30,8 +30,9 @@ TILE = (64, 65, 535, 535)          # rounded blue tile
 GLYPH_BOX = (100, 100, 500, 500)   # area inside the tile that holds the bubble (clear of the rounded corners)
 WORDMARK = (733, 144, 1040, 213)   # "imessager" text on the light card
 
-# Tile colors, top to bottom; sampled from the sheet in main() so a flat or gradient tile both come through.
-STOPS = [(0.0, (97, 168, 247)), (0.5, (36, 131, 242)), (1.0, (25, 108, 210))]
+# Tile color: flat Messages green, top to bottom. (sample_stops() can take a gradient from the sheet instead.)
+GREEN = (52, 199, 89)
+STOPS = [(0.0, GREEN), (1.0, GREEN)]
 
 
 def scale_layout(sheet):
@@ -152,7 +153,6 @@ def template(mask, height, color):
 def main():
     sheet = Image.open(SHEET)
     scale_layout(sheet)
-    sample_stops(sheet)
     print("tile colors:", STOPS)
     glyph = glyph_mask(sheet)
     text = text_mask(sheet)
