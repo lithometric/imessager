@@ -23,7 +23,7 @@ A native macOS app that answers your iMessages with an OpenRouter model. You swi
 
 ## Run it
 
-Requires macOS 14+ and Xcode (or the Swift toolchain).
+Runs on macOS 14+. Building needs Xcode 26 or later (or its Command Line Tools). [INSTALL.md](INSTALL.md) covers installing from scratch, updating and sharing a copy with someone else.
 
 ```bash
 scripts/build-app.sh --run       # build build/iMessager.app and launch it
